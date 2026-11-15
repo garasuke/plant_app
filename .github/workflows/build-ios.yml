@@ -1,7 +1,8 @@
+# 署名なしのiPhone用アプリ(.ipa)をGitHubのMacで作る。署名はWindowsのSideloadlyで行う。
 name: Build unsigned IPA
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:      # GitHubの「Actions」画面から手動で実行
   push:
     branches: [main]
 
@@ -11,15 +12,22 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
-      - run: npx expo prebuild --platform ios --no-install
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Generate iOS project (expo prebuild)
+        run: npx expo prebuild --platform ios --no-install
+
       - name: Install CocoaPods
         working-directory: ios
         run: pod install
+
       - name: Build (no code signing)
         run: |
           set -o pipefail
@@ -32,14 +40,18 @@ jobs:
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build | tail -n 60
+
       - name: Package .ipa
         run: |
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          echo "app = $APP"
           mkdir -p Payload
           cp -R "$APP" Payload/
-          zip -qry focustest.ipa Payload
+          zip -qry plant-client.ipa Payload
+          ls -lh plant-client.ipa
+
       - uses: actions/upload-artifact@v4
         with:
-          name: focustest-ipa
-          path: focustest.ipa
+          name: plant-client-ipa
+          path: plant-client.ipa
           retention-days: 14
