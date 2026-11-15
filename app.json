@@ -1,19 +1,21 @@
 {
   "expo": {
-    "name": "ピント連写テスト",
-    "slug": "focustest",
+    "name": "植物管理",
+    "slug": "plantclient",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.plantapp.focustest",
+      "bundleIdentifier": "com.plantapp.client",
       "infoPlist": {
-        "NSCameraUsageDescription": "ピントをずらして連続撮影するためにカメラを使います",
-        "NSPhotoLibraryAddUsageDescription": "撮影した写真を写真アプリへ保存するために使います",
-        "UIFileSharingEnabled": true,
-        "LSSupportsOpeningDocumentsInPlace": true,
+        "NSCameraUsageDescription": "植物の写真・ピントをずらした連写を撮影するためにカメラを使います",
+        "NSMicrophoneUsageDescription": "動画を撮影するときにマイクを使います",
+        "NSLocalNetworkUsageDescription": "自宅のサーバー(植物管理システム)に接続するために使います",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        },
         "ITSAppUsesNonExemptEncryption": false
       }
     }
