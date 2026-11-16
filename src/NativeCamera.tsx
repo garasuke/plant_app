@@ -100,7 +100,10 @@ export default function NativeCamera({
     [allDevices],
   );
   const [devId, setDevId] = useState<string | null>(null);
-  const device = backs.find((d) => d.id === devId) ?? backs[0] ?? undefined;
+  // 写真・QR: レンズが一番多いカメラ(0.5x〜望遠をまとめて切り替えられる)。ピント合成: ピント位置の固定に対応しているカメラを優先
+  const lockable = backs.filter((d) => d.supportsFocusLocking);
+  const autoDev = mode === 'burst' ? (lockable[0] ?? backs[0]) : backs[0];
+  const device = backs.find((d) => d.id === devId) ?? autoDev ?? undefined;
   const photoOutput = usePhotoOutput({ qualityPrioritization: 'quality', containerFormat: 'jpeg', quality: 0.9 });
   const videoOutput = useVideoOutput({ targetResolution: CommonResolutions.UHD_16_9, enableAudio: false });
   const objectOutput = useObjectOutput({
@@ -410,12 +413,12 @@ export default function NativeCamera({
                     </View>
                     {backs.length > 1 && (
                       <>
-                        <Text style={s.label}>カメラ(切り替わらないときはここで直接選べます)</Text>
+                        <Text style={s.label}>カメラ(◎=ピント合成に対応 ×=非対応。切り替わらないときはここで直接選べます)</Text>
                         <View style={s.row}>
                           {backs.map((d) => (
                             <Chip
                               key={d.id}
-                              label={`${d.localizedName.replace('Back ', '')}(${d.physicalDevices.length})`}
+                              label={`${d.localizedName.replace('Back ', '')}(${d.physicalDevices.length})${d.supportsFocusLocking ? ' ◎' : ' ×'}`}
                               on={device?.id === d.id}
                               onPress={() => {
                                 if (disabled) return;
