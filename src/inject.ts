@@ -91,7 +91,29 @@ export const INJECT_BEFORE = `
       function (e) { post({ t: 'error', id: s.id, msg: (e && e.message) || String(e) }); }
     );
   }
+  // ---- ダウンロード: ページ(ログイン済み)の権限で取得し、アプリへ渡す ----
+  async function dl(url, hint) {
+    try {
+      post({ t: 'dlstart' });
+      var r = await fetch(url, { credentials: 'same-origin' });
+      if (!r.ok) { throw new Error('サーバーの応答エラー (' + r.status + ')'); }
+      var cd = r.headers.get('Content-Disposition') || '', name = '', m = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+      if (m) { try { name = decodeURIComponent(m[1]); } catch (e) {} }
+      if (!name) { m = /filename="?([^";]+)"?/i.exec(cd); if (m) { name = m[1]; } }
+      var b = await r.blob();
+      var fr = new FileReader();
+      fr.onload = function () { var d = String(fr.result); post({ t: 'dl', name: name || hint || '', mime: b.type || '', url: url, b64: d.slice(d.indexOf(',') + 1) }); };
+      fr.onerror = function () { post({ t: 'dlerr', msg: 'ファイルを読み取れませんでした' }); };
+      fr.readAsDataURL(b);
+    } catch (e) { post({ t: 'dlerr', msg: (e && e.message) || String(e) }); }
+  }
+  document.addEventListener('click', function (e) {
+    var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+    if (a && a.href && a.href.indexOf('blob:') !== 0) { e.preventDefault(); e.stopPropagation(); dl(a.href, a.getAttribute('download') || ''); }
+  }, true);
+
   window.__nc = {
+    dl: dl,
     geo: function (g) { window.__ncGeo = g ? { lat: g.lat, lng: g.lng, acc: g.acc, at: Date.now() } : null; },
     recv: function (id, kind, index, total, name, mime, b64) {
       var s = sessions[id]; if (!s) { return; }
@@ -148,6 +170,9 @@ export const INJECT_BEFORE = `
         else if (kind === 'memo') {
           d = await apiJson('memo_inbox_api.php', { method: 'POST', headers: { 'X-CSRF-Token': csrf() }, body: form({ action: 'add', data: JSON.stringify(p.data) }) });
         }
+        else if (kind === 'link') {
+          d = await apiJson(p.api + '?action=save', { method: 'POST', headers: { 'X-CSRF-Token': csrf() }, body: form({ data: JSON.stringify(p.data) }) });
+        }
         else if (kind === 'upload') {
           var u = blobs[p.key] && blobs[p.key][0]; if (!u) { throw new Error('送る写真がありません'); }
           if (p.geo) { window.__ncGeo = { lat: p.geo.lat, lng: p.geo.lng, acc: p.geo.acc, at: Date.now() }; }
@@ -183,18 +208,24 @@ export const INJECT_RESEARCH = `
   window.__rsInstalled = true;
   function post(m) { try { window.ReactNativeWebView.postMessage(JSON.stringify(m)); } catch (e) {} }
   var timer = null, sx = 0, sy = 0;
-  function pick(t) {
-    var img = t.closest ? t.closest('img') : null;
-    var a = t.closest ? t.closest('a[href]') : null;
-    var sel = String(window.getSelection ? window.getSelection() : '');
-    return { text: sel.trim(), href: a ? a.href : '', src: img ? (img.currentSrc || img.src) : '', title: document.title, url: location.href };
+  function isInput(t) {
+    if (!t || !t.closest) { return false; }
+    return !!t.closest('input,textarea,select,[contenteditable],[contenteditable=""],[contenteditable="true"]');
   }
   document.addEventListener('touchstart', function (e) {
-    if (e.touches.length !== 1) { return; }
-    sx = e.touches[0].clientX; sy = e.touches[0].clientY;
-    var t = e.target;
     clearTimeout(timer);
-    timer = setTimeout(function () { post(Object.assign({ t: 'ctx' }, pick(t))); }, 650);
+    if (e.touches.length !== 1) { return; }
+    var t = e.target;
+    if (isInput(t)) { return; }
+    var img = t.closest ? t.closest('img') : null;
+    var a = t.closest ? t.closest('a[href]') : null;
+    if (!img && !a) { return; }   // 文字などは、iOS標準の選択メニュー(項目を足してあります)に任せる
+    sx = e.touches[0].clientX; sy = e.touches[0].clientY;
+    timer = setTimeout(function () {
+      var sel = String(window.getSelection ? window.getSelection() : '').trim();
+      if (sel) { return; }   // 文字が選ばれたときは、選択メニューのほうを使う
+      post({ t: 'ctx', text: '', href: a ? a.href : '', src: img ? (img.currentSrc || img.src) : '', title: document.title, url: location.href });
+    }, 650);
   }, { passive: true });
   function cancel() { clearTimeout(timer); }
   document.addEventListener('touchmove', function (e) {
@@ -203,8 +234,7 @@ export const INJECT_RESEARCH = `
   }, { passive: true });
   document.addEventListener('touchend', cancel, { passive: true });
   document.addEventListener('touchcancel', cancel, { passive: true });
-  document.addEventListener('contextmenu', function (e) { e.preventDefault(); }, true);
-  document.documentElement.style.webkitTouchCallout = 'none';
+  document.addEventListener('contextmenu', function (e) { if (!isInput(e.target)) { e.preventDefault(); } }, true);
 })();
 true;
 `;

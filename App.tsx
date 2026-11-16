@@ -18,6 +18,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   Switch,
   Text,
@@ -33,7 +34,7 @@ import { INJECT_BEFORE } from './src/inject';
 import NativeCamera, { type CamMode, type CamRequest, type Msg, type SendMeta, type Taken } from './src/NativeCamera';
 import { cancelAllNotify, ensureNotifyPermission, scheduleFromItems, type NotifyItem } from './src/notify';
 import { itemFileUri, queueAdd, queueList, queueRemove, queueUpdate, type QItem } from './src/queue';
-import ResearchBrowser, { type CtxInfo } from './src/ResearchBrowser';
+import ResearchBrowser, { type CtxInfo, type PageInfo } from './src/ResearchBrowser';
 
 type Geo = { lat: number; lng: number; acc: number; at: number };
 
@@ -71,9 +72,8 @@ export default function App() {
 
   const [splitOn, setSplitOn] = useState(false);
   const [phoneResearch, setPhoneResearch] = useState(false);
-  const [rUrl, setRUrl] = useState('https://www.google.com');
+  const [rUrl, setRUrl] = useState('');
   const [rTick, setRTick] = useState(0);
-  const lastUrl = useRef('');
 
   const webRef = useRef<WebView<object>>(null);
   const workRef = useRef<WebView<object>>(null);
@@ -85,6 +85,9 @@ export default function App() {
   const pend = useRef(new Map<string, { res: (v: any) => void; rej: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>());
   const wseq = useRef(0);
   const workLoaded = useRef(false);
+  const workFailed = useRef(false);
+  const saveDlRef = useRef<(m: any) => void>(() => {});
+  const lastFail = useRef(0);
   const syncing = useRef(false);
   const lastNotify = useRef(0);
   const geoRef = useRef<Geo | null>(null);
@@ -153,8 +156,10 @@ export default function App() {
         // 読み込み直す
       }
       workLoaded.current = false;
+      workFailed.current = false;
       workRef.current?.reload();
-      for (let i = 0; i < 12 && !workLoaded.current; i++) await sleep(1000);
+      for (let i = 0; i < 12 && !workLoaded.current && !workFailed.current; i++) await sleep(1000);
+      if (workFailed.current) return false; // つながらない(圏外など)ときは、すぐ諦めて次の機会を待つ
     }
     return false;
   }, [call]);
@@ -170,6 +175,7 @@ export default function App() {
   const syncQueue = useCallback(
     async (manual = false) => {
       if (syncing.current) return;
+      if (!manual && Date.now() - lastFail.current < 60000) return;
       syncing.current = true;
       try {
         const items = await refreshPending();
@@ -178,9 +184,10 @@ export default function App() {
           setSyncMsg('');
           return;
         }
-        setSyncMsg(`未送信 ${items.length}件: 接続を確認しています…`);
+        if (manual) setSyncMsg(`未送信 ${items.length}件: 接続を確認しています…`);
         if (!(await ensureWorker())) {
-          setSyncMsg(`未送信 ${items.length}件: サーバーに接続できないため、つながったら自動で送ります`);
+          lastFail.current = Date.now();
+          setSyncMsg(`未送信 ${items.length}件(接続待ち。つながると自動で送ります)`);
           if (manual) toast('サーバーに接続できません(VPN・ログインを確認してください)');
           return;
         }
@@ -213,7 +220,10 @@ export default function App() {
             it.tries += 1;
             it.error = m;
             await queueUpdate(it);
-            if (/ログイン|時間内|ネットワーク|network|接続/i.test(m)) break;
+            if (/ログイン|時間内|ネットワーク|network|接続|Failed to fetch|Load failed/i.test(m)) {
+              lastFail.current = Date.now();
+              break;
+            }
           }
         }
         const left = await refreshPending();
@@ -363,6 +373,15 @@ export default function App() {
         case 'target':
           if (cur && m.id === cur.id) setCamTarget(String(m.name || ''));
           break;
+        case 'dlstart':
+          toast('ファイルを取得しています…');
+          break;
+        case 'dl':
+          saveDlRef.current(m);
+          break;
+        case 'dlerr':
+          toast('ダウンロードできませんでした: ' + String(m.msg || ''));
+          break;
         case 'saved':
           setSending(false);
           setSavedTick((t) => t + 1);
@@ -375,7 +394,7 @@ export default function App() {
           break;
       }
     },
-    [closeCam, startGeo],
+    [closeCam, startGeo, toast],
   );
 
   const onSend = useCallback(
@@ -477,40 +496,108 @@ export default function App() {
     [call, ensureWorker, putFile, toast],
   );
 
+  const addLink = useCallback(
+    async (kind: 'bookmarks' | 'links', url: string, title: string) => {
+      if (!/^https?:\/\//i.test(url)) {
+        toast('このページは登録できません(http / https のページのみ)');
+        return;
+      }
+      try {
+        if (!(await ensureWorker())) throw new Error('サーバーに接続できません(ログインを確認してください)');
+        await call('link', {
+          api: kind === 'links' ? 'links_api.php' : 'bookmarks_api.php',
+          data: { url, title: title.slice(0, 200), categories: [], note: '' },
+        });
+        toast(`${kind === 'links' ? 'リンク集' : 'ブックマーク'}に追加しました: ${title || url}`.slice(0, 80));
+      } catch (e) {
+        toast('登録できませんでした: ' + errMsg(e));
+      }
+    },
+    [call, ensureWorker, toast],
+  );
+
+  const openInResearch = useCallback((u: string) => {
+    setRUrl(u);
+    setRTick((t) => t + 1);
+  }, []);
+
+  const sheet = (title: string, opts: { label: string; fn: () => void }[]) => {
+    ActionSheetIOS.showActionSheetWithOptions(
+      { options: [...opts.map((o) => o.label), 'キャンセル'], cancelButtonIndex: opts.length, title: title.slice(0, 70) },
+      (i) => {
+        if (i < opts.length) opts[i].fn();
+      },
+    );
+  };
+
+  // リンク・画像の長押し
   const onCtx = useCallback(
     (c: CtxInfo) => {
       const opts: { label: string; fn: () => void }[] = [];
-      if (c.text) {
-        opts.push({ label: '選んだ文字を一時メモに追加', fn: () => memoAdd(c.text, c.title, c.url) });
-        opts.push({
-          label: '選んだ文字で検索',
-          fn: () => {
-            setRUrl('https://www.google.com/search?q=' + encodeURIComponent(c.text.slice(0, 200)));
-            setRTick((t) => t + 1);
-          },
-        });
-      }
       if (c.src) opts.push({ label: '画像をファイル管理に保存', fn: () => saveImage(c.src) });
       if (c.href) {
+        opts.push({ label: 'リンク先を開く', fn: () => openInResearch(c.href) });
         opts.push({ label: 'リンクを一時メモに追加', fn: () => memoAdd(c.href, c.title, c.href) });
-        opts.push({
-          label: 'リンク先を開く',
-          fn: () => {
-            setRUrl(c.href);
-            setRTick((t) => t + 1);
-          },
-        });
+        opts.push({ label: 'リンクをブックマークに追加', fn: () => addLink('bookmarks', c.href, c.href) });
+        opts.push({ label: 'リンクをリンク集に追加', fn: () => addLink('links', c.href, c.href) });
       }
-      opts.push({ label: 'このページを一時メモに追加', fn: () => memoAdd(c.title || c.url, c.title, c.url) });
-      ActionSheetIOS.showActionSheetWithOptions(
-        { options: [...opts.map((o) => o.label), 'キャンセル'], cancelButtonIndex: opts.length, title: c.text ? c.text.slice(0, 60) : c.href || c.src || c.title },
-        (i) => {
-          if (i < opts.length) opts[i].fn();
-        },
-      );
+      if (!opts.length) return;
+      sheet(c.href || c.src, opts);
     },
-    [memoAdd, saveImage],
+    [addLink, memoAdd, openInResearch, saveImage],
   );
+
+  // 文字を選んだときの、iOS標準メニューに足した項目
+  const onSel = useCallback(
+    (key: string, text: string, page: PageInfo) => {
+      if (key === 'memo') memoAdd(text, page.title, page.url);
+      else if (key === 'search') openInResearch('https://www.google.com/search?q=' + encodeURIComponent(text.slice(0, 200)));
+      else if (key === 'bm') addLink('bookmarks', page.url, page.title);
+    },
+    [addLink, memoAdd, openInResearch],
+  );
+
+  // 調べもの画面の ★(いま開いているページの登録)
+  const onPageMenu = useCallback(
+    (pg: PageInfo) => {
+      sheet(pg.title || pg.url, [
+        { label: 'ブックマークに追加', fn: () => addLink('bookmarks', pg.url, pg.title) },
+        { label: 'リンク集に追加', fn: () => addLink('links', pg.url, pg.title) },
+        { label: '一時メモに追加', fn: () => memoAdd(pg.title || pg.url, pg.title, pg.url) },
+      ]);
+    },
+    [addLink, memoAdd],
+  );
+
+  // ---------- ダウンロード(ページ側で取得 → 端末に保存 → 共有メニュー) ----------
+  const startDownload = useCallback(
+    (u: string) => js(`window.__nc&&window.__nc.dl(${JSON.stringify(u)},"")`),
+    [js],
+  );
+  const saveDownloaded = useCallback(
+    async (m: { name: string; mime: string; url: string; b64: string }) => {
+      try {
+        const extOf: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'application/pdf': 'pdf', 'text/plain': 'txt', 'video/mp4': 'mp4' };
+        let name = (m.name || '').replace(/[\\/:*?"<>|]/g, '_').trim();
+        if (!name) name = 'download_' + stampOf(Date.now()) + (extOf[m.mime] ? '.' + extOf[m.mime] : '');
+        const bin = atob(m.b64);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        const dir = new Directory(Paths.cache, 'dl');
+        dir.create({ intermediates: true, idempotent: true });
+        const f = new File(dir, name);
+        if (f.exists) f.delete();
+        f.create();
+        f.write(u8);
+        toast('取得しました: ' + name);
+        await Share.share({ url: f.uri });
+      } catch (e) {
+        toast('ファイルを保存できませんでした: ' + errMsg(e));
+      }
+    },
+    [toast],
+  );
+  saveDlRef.current = saveDownloaded;
 
   // ---------- 起動・復帰 ----------
   useEffect(() => {
@@ -548,8 +635,10 @@ export default function App() {
     };
   }, [loadErr, refreshNotify, refreshPending, syncQueue]);
 
-  const onWorkLoadEnd = useCallback(() => {
+  const onWorkLoad = useCallback(() => {
     workLoaded.current = true;
+    workFailed.current = false;
+    lastFail.current = 0;
     syncQueue();
     if (Date.now() - lastNotify.current > 30 * 60 * 1000) refreshNotify();
   }, [refreshNotify, syncQueue]);
@@ -581,6 +670,9 @@ export default function App() {
   }
   const url = settings.url;
   const split = isPad && wide && splitOn;
+  const base = url.replace(/\/+$/, '');
+  const home = base + '/bookmarks.php';
+  const linksUrl = base + '/links.php';
 
   const mainWeb = (
     <WebView<object>
@@ -602,16 +694,30 @@ export default function App() {
       onError={(e) => setLoadErr(e.nativeEvent.description || '読み込めませんでした')}
       onHttpError={(e) => setLoadErr(`サーバーの応答エラー (${e.nativeEvent.statusCode})`)}
       onContentProcessDidTerminate={() => webRef.current?.reload()}
+      onFileDownload={(e) => startDownload(e.nativeEvent.downloadUrl)}
+      onShouldStartLoadWithRequest={(r) => {
+        const isDl = /library_file\.php\?[^#]*mode=(download|open)/.test(r.url) || /[?&]dl=1(&|#|$)/.test(r.url) || /attach_file\.php/.test(r.url);
+        if (isDl && r.isTopFrame !== false && r.navigationType !== 'backforward') {
+          startDownload(r.url);
+          return false;
+        }
+        return true;
+      }}
     />
   );
 
   return (
     <SafeAreaProvider>
-      <SafeAreaView style={s.root} edges={['top', 'left', 'right']}>
+      <SafeAreaView style={s.root} edges={['top', 'left', 'right', 'bottom']}>
         <StatusBar style="dark" />
         <View style={s.rowFill}>
           <View style={{ flex: 1 }}>
             {mainWeb}
+            {!!syncMsg && (
+              <Pressable style={s.sync} onPress={() => { refreshPending(); setShowQueue(true); }}>
+                <Text style={s.syncT}>{syncMsg}</Text>
+              </Pressable>
+            )}
             {!!loadErr && (
               <View style={s.err}>
                 <Text style={s.errT}>読み込めません: {loadErr}</Text>
@@ -628,15 +734,16 @@ export default function App() {
           </View>
           {split && (
             <View style={s.side}>
-              <ResearchBrowser url={rUrl} navTick={rTick} onCtx={onCtx} onUrl={(u) => (lastUrl.current = u)} />
+              <ResearchBrowser home={home} linksUrl={linksUrl} url={rUrl} navTick={rTick} onCtx={onCtx} onSel={onSel} onPageMenu={onPageMenu} />
             </View>
           )}
         </View>
 
-        {/* ボタン(左下) */}
-        <View style={s.fabs}>
-          <Pressable style={s.fab} onPress={() => openQuick('photo')}>
-            <Text style={s.fabT}>📷</Text>
+        {/* 下の機能バー(画面の下部バーと重ならないよう、別の行にしてある) */}
+        <View style={s.bottomBar}>
+          <Pressable style={s.tab} onPress={() => openQuick('photo')}>
+            <Text style={s.tabI}>📷</Text>
+            <Text style={s.tabT}>クイック撮影</Text>
             {pending > 0 && (
               <View style={s.badge}>
                 <Text style={s.badgeT}>{pending}</Text>
@@ -644,30 +751,27 @@ export default function App() {
             )}
           </Pressable>
           <Pressable
-            style={s.fab}
+            style={s.tab}
             onPress={() => {
               if (isPad && wide) setSplitOn(!splitOn);
               else setPhoneResearch(true);
             }}
           >
-            <Text style={s.fabT}>{split ? '✕' : '🔎'}</Text>
+            <Text style={s.tabI}>{split ? '✕' : '🔎'}</Text>
+            <Text style={s.tabT}>{split ? '調べものを閉じる' : '調べもの'}</Text>
           </Pressable>
           <Pressable
-            style={s.fab}
+            style={s.tab}
             onPress={() => {
               setDraft(settings);
               refreshPending();
               setShowSettings(true);
             }}
           >
-            <Text style={s.fabT}>⚙</Text>
+            <Text style={s.tabI}>⚙</Text>
+            <Text style={s.tabT}>設定</Text>
           </Pressable>
         </View>
-        {!!syncMsg && (
-          <Pressable style={s.sync} onPress={() => { refreshPending(); setShowQueue(true); }}>
-            <Text style={s.syncT}>{syncMsg}</Text>
-          </Pressable>
-        )}
         {!!toastT && (
           <View style={s.toast} pointerEvents="none">
             <Text style={s.toastT}>{toastT}</Text>
@@ -685,7 +789,15 @@ export default function App() {
             sharedCookiesEnabled
             injectedJavaScriptBeforeContentLoaded={INJECT_BEFORE}
             onMessage={onWorkMessage}
-            onLoadEnd={onWorkLoadEnd}
+            onLoad={onWorkLoad}
+            onError={() => {
+              workLoaded.current = false;
+              workFailed.current = true;
+            }}
+            onHttpError={() => {
+              workLoaded.current = false;
+              workFailed.current = true;
+            }}
             onContentProcessDidTerminate={() => workRef.current?.reload()}
           />
         </View>
@@ -711,7 +823,7 @@ export default function App() {
         <Modal visible={phoneResearch} animationType="slide" presentationStyle="fullScreen" onRequestClose={() => setPhoneResearch(false)}>
           <SafeAreaProvider>
             <SafeAreaView style={{ flex: 1 }}>
-              <ResearchBrowser url={rUrl} navTick={rTick} onCtx={onCtx} onClose={() => setPhoneResearch(false)} />
+              <ResearchBrowser home={home} linksUrl={linksUrl} url={rUrl} navTick={rTick} onCtx={onCtx} onSel={onSel} onPageMenu={onPageMenu} onClose={() => setPhoneResearch(false)} />
             </SafeAreaView>
           </SafeAreaProvider>
         </Modal>
@@ -846,12 +958,13 @@ const s = StyleSheet.create({
   err: { position: 'absolute', left: 12, right: 12, top: 60, backgroundColor: '#fff3f3', borderColor: '#b00020', borderWidth: 1, borderRadius: 8, padding: 10, gap: 6 },
   errT: { color: '#b00020', fontWeight: '700' },
   errH: { color: '#533', fontSize: 12 },
-  fabs: { position: 'absolute', left: 8, bottom: 8, flexDirection: 'row', gap: 8 },
-  fab: { width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(0,0,0,0.5)', alignItems: 'center', justifyContent: 'center' },
-  fabT: { color: '#fff', fontSize: 18 },
-  badge: { position: 'absolute', right: -4, top: -4, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: '#d32f2f', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3 },
+  bottomBar: { flexDirection: 'row', backgroundColor: '#eef3ee', borderTopWidth: 1, borderTopColor: '#b9c9b9' },
+  tab: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: 5 },
+  tabI: { fontSize: 18 },
+  tabT: { fontSize: 10, color: '#2e5a32', fontWeight: '600' },
+  badge: { position: 'absolute', right: '22%', top: 2, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: '#d32f2f', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3 },
   badgeT: { color: '#fff', fontSize: 11, fontWeight: '700' },
-  sync: { position: 'absolute', left: 8, bottom: 56, right: 8, backgroundColor: 'rgba(20,60,30,0.9)', borderRadius: 8, padding: 8 },
+  sync: { position: 'absolute', left: 8, bottom: 8, right: 8, backgroundColor: 'rgba(20,60,30,0.9)', borderRadius: 8, padding: 8 },
   syncT: { color: '#fff', fontSize: 12 },
   toast: { position: 'absolute', left: 16, right: 16, top: 56, backgroundColor: 'rgba(0,0,0,0.8)', borderRadius: 10, padding: 10 },
   toastT: { color: '#fff', fontSize: 13 },
