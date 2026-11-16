@@ -1,0 +1,34 @@
+diff --git a/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/Values/JavaScriptObject.swift b/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/Values/JavaScriptObject.swift
+--- a/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/Values/JavaScriptObject.swift
++++ b/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/Values/JavaScriptObject.swift
+@@ -921,6 +921,12 @@
+   }
+ }
+ 
++/// Carries the temporary value's pointer into a `JavaScriptActor` closure. The pointer is only used on the
++/// calling thread while the closure runs synchronously, so the unchecked conformance is safe here.
++private struct EncodedValueSlotBox: @unchecked Sendable {
++  let pointer: UnsafeMutablePointer<facebook.jsi.Value>
++}
++
+ /// Calls `encode` with a slot in a temporary engine value and the runtime, then `body` with the value it
+ /// wrote. A value that `encode` doesn't write stays `undefined`. The value is destroyed when `body`
+ /// returns, which calls into the engine only for a value with an engine handle.
+@@ -935,6 +941,8 @@
+   try withUnsafeTemporaryAllocation(of: facebook.jsi.Value.self, capacity: 1) { buffer in
+     // The isolated closure below runs synchronously on this thread.
+     nonisolated(unsafe) let slot = buffer.baseAddress!
++    // Wrap the pointer so the isolated closure below captures a Sendable value, not `slot`.
++    let slotBox = EncodedValueSlotBox(pointer: slot)
+     expo.emplaceUndefined(slot)
+     defer {
+       expo.destroyValues(slot, 1)
+@@ -943,7 +951,7 @@
+     // a retain.
+     try runtime._withUnsafeGuaranteedRef { runtime in
+       try JavaScriptActor.assumeIsolated {
+-        try encode(JavaScriptValue.Slot(slot), runtime)
++        try encode(JavaScriptValue.Slot(slotBox.pointer), runtime)
+       }
+     }
+     body(slot.pointee)
