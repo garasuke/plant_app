@@ -25,20 +25,36 @@ export const INJECT_BEFORE = `
   }
 
   // ---- 撮影場所を保存に添える ----
+  // 保存の完了(サーバーが受け取った)は、ページ側の後片付け(一覧の再読み込みなど)を待たずに、ここで知らせる
   var ofetch = window.fetch;
   window.fetch = function (u, init) {
+    var act = '';
     try {
       var g = window.__ncGeo;
-      if (g && Date.now() - g.at < 10 * 60 * 1000 && init && init.body instanceof FormData && String(u).indexOf('cam_api.php') >= 0) {
+      if (init && init.body instanceof FormData && String(u).indexOf('cam_api.php') >= 0) {
         var a = init.body.get('action');
-        if ((a === 'upload' || a === 'stack') && !init.body.has('lat')) {
-          init.body.append('lat', Number(g.lat).toFixed(6));
-          init.body.append('lng', Number(g.lng).toFixed(6));
-          init.body.append('geo_acc', String(Math.round(g.acc || 0)));
+        if ((a === 'upload' || a === 'stack')) {
+          act = a;
+          if (g && Date.now() - g.at < 10 * 60 * 1000 && !init.body.has('lat')) {
+            init.body.append('lat', Number(g.lat).toFixed(6));
+            init.body.append('lng', Number(g.lng).toFixed(6));
+            init.body.append('geo_acc', String(Math.round(g.acc || 0)));
+          }
+          // 二重登録を防ぐための撮影ごとの番号(サーバーが対応していれば使われる)
+          if (window.__ncJob && !init.body.has('client_id')) { init.body.append('client_id', String(window.__ncJob)); }
         }
       }
     } catch (e) {}
-    return ofetch.apply(this, arguments);
+    var pr = ofetch.apply(this, arguments);
+    if (act && window.__ncJob) {
+      var job = window.__ncJob;
+      pr.then(function (r) {
+        try {
+          r.clone().json().then(function (d) { post({ t: 'sent', job: job, ok: !(d && d.ok === false), msg: d && d.error ? String(d.error) : '' }); }, function () { post({ t: 'sent', job: job, ok: r.ok }); });
+        } catch (e) {}
+      }, function () {});
+    }
+    return pr;
   };
 
   function wrap(p) {
@@ -59,11 +75,13 @@ export const INJECT_BEFORE = `
         modes: native, mode: curMode,
         keepOpen: !!o.keepOpen,
         hasWeb: all.indexOf('video') >= 0,
-        target: M.id ? M.name : ''
+        target: M.id ? M.name : '',
+        meta: metaOf()
       });
+      function metaOf() { return { table: M.table, target_id: M.id, folder_id: M.folder_id, tags: M.tags }; }
       function changed() {
         if (mo.onChange) { try { mo.onChange({ target: M.id ? { table: M.table, id: M.id, name: M.name, kind: M.kind } : null, folder_id: M.folder_id, tags: M.tags }); } catch (e) {} }
-        post({ t: 'target', id: id, name: M.id ? M.name : '' });
+        post({ t: 'target', id: id, name: M.id ? M.name : '', meta: metaOf() });
       }
       return {
         close: function () { post({ t: 'close', id: id }); },
@@ -80,15 +98,16 @@ export const INJECT_BEFORE = `
     };
     p.__nc = true;
   }
-  function run(s, kind, list, names) {
+  function run(s, kind, list, names, job) {
     var o = s.o, pr;
+    window.__ncJob = job || '';
     try {
       if (kind === 'photo') { pr = o.onPhoto ? o.onPhoto(list[0], names[0]) : null; }
       else { pr = o.onBurst ? o.onBurst(list) : null; }
     } catch (e) { pr = Promise.reject(e); }
     Promise.resolve(pr).then(
-      function () { post({ t: 'saved', id: s.id, kind: kind }); },
-      function (e) { post({ t: 'error', id: s.id, msg: (e && e.message) || String(e) }); }
+      function () { if (window.__ncJob === job) { window.__ncJob = ''; } post({ t: 'saved', id: s.id, kind: kind, job: job }); },
+      function (e) { if (window.__ncJob === job) { window.__ncJob = ''; } post({ t: 'error', id: s.id, job: job, msg: (e && e.message) || String(e) }); }
     );
   }
   // ---- ダウンロード: ページ(ログイン済み)の権限で取得し、アプリへ渡す ----
@@ -115,15 +134,15 @@ export const INJECT_BEFORE = `
   window.__nc = {
     dl: dl,
     geo: function (g) { window.__ncGeo = g ? { lat: g.lat, lng: g.lng, acc: g.acc, at: Date.now() } : null; },
-    recv: function (id, kind, index, total, name, mime, b64) {
-      var s = sessions[id]; if (!s) { return; }
+    recv: function (id, kind, index, total, name, mime, b64, job) {
+      var s = sessions[id]; if (!s) { post({ t: 'error', id: id, job: job, msg: 'カメラの画面が閉じられていました(ページが読み込み直された可能性があります)' }); return; }
       var arr = s.parts[kind] = s.parts[kind] || [];
       var nm = s.names[kind] = s.names[kind] || [];
       arr[index] = b64blob(b64, mime); nm[index] = name;
       var have = 0; for (var j = 0; j < total; j++) { if (arr[j]) { have++; } }
       if (have < total) { return; }
       delete s.parts[kind]; delete s.names[kind];
-      run(s, kind, arr, nm);
+      run(s, kind, arr, nm, job);
     },
     qr: function (id, text) {
       var s = sessions[id]; if (!s || !s.o.onQR) { return; }

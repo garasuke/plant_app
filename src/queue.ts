@@ -12,6 +12,9 @@ export type QItem = {
   geo?: { lat: number; lng: number; acc: number };
   tries: number;
   error?: string;
+  cid?: string; // 撮影ごとの番号(二重登録を防ぐため、送るときにサーバーへ添える)
+  extra?: Record<string, string>; // 保存先(フォルダ・記録など)。ファイル管理のカメラで撮ったとき
+  hold?: boolean; // true の間は自動で送らない(送れたか分からないもの・手動で確認するもの)
 };
 
 const root = () => new Directory(Paths.document, 'queue');
@@ -44,7 +47,7 @@ export async function queueList(): Promise<QItem[]> {
 export async function queueAdd(
   kind: QItem['kind'],
   srcPaths: string[],
-  extra: { name?: string; qr?: string; geo?: QItem['geo'] },
+  extra: { name?: string; qr?: string; geo?: QItem['geo']; cid?: string; extra?: Record<string, string>; hold?: boolean; error?: string },
 ): Promise<QItem> {
   const id = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const d = dirOf(id);
@@ -56,7 +59,20 @@ export async function queueAdd(
     src.copy(new File(d, nm));
     files.push(nm);
   });
-  const it: QItem = { id, kind, at: Date.now(), files, name: extra.name || '', qr: extra.qr || '', geo: extra.geo, tries: 0 };
+  const it: QItem = {
+    id,
+    kind,
+    at: Date.now(),
+    files,
+    name: extra.name || '',
+    qr: extra.qr || '',
+    geo: extra.geo,
+    tries: 0,
+    cid: extra.cid || id,
+    extra: extra.extra,
+    hold: extra.hold,
+    error: extra.error,
+  };
   const m = new File(d, 'meta.json');
   m.create();
   m.write(JSON.stringify(it));

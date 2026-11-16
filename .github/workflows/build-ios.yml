@@ -28,6 +28,11 @@ jobs:
       - name: Install JS dependencies
         run: npm ci
 
+      - name: Write build info (shown in the app diagnostics screen)
+        run: |
+          printf "export const BUILD_AT = '%s';\nexport const BUILD_SHA = '%s';\n" "$(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M JST')" "$GITHUB_SHA" > src/buildinfo.ts
+          cat src/buildinfo.ts
+
       - name: Generate iOS project (expo prebuild)
         run: npx expo prebuild --platform ios --no-install
 

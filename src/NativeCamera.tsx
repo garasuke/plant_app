@@ -5,6 +5,8 @@
 // ・順番待ち(圏外用)として使うときは、結果を端末内へ貯める(親が処理)
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Image, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useKeepAwake } from 'expo-keep-awake';
+import { DeviceMotion } from 'expo-sensors';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { getThumbnailAsync } from 'expo-video-thumbnails';
 import {
@@ -31,6 +33,7 @@ export type CamRequest = {
 export type Taken = { path: string };
 export type Msg = { text: string; error?: boolean };
 export type SendMeta = { name?: string; qr?: string };
+export type CamOpts = { review: boolean; grid: boolean; keyShutter: boolean; lockExposure: boolean };
 
 type Frame = { path: string; label: string };
 
@@ -47,8 +50,9 @@ function positions(n: number, from: number, to: number): number[] {
 type Props = {
   req: CamRequest;
   message: Msg;
-  sending: boolean;
-  savedTick: number;
+  jobs: number; // 裏で保存している件数
+  jobText: string; // 保存の状況(例: 保存待ち 2件)
+  opts: CamOpts;
   target: string;
   forceMode: { mode: CamMode; tick: number } | null;
   titleText: string;
@@ -62,8 +66,9 @@ type Props = {
 export default function NativeCamera({
   req,
   message,
-  sending,
-  savedTick,
+  jobs,
+  jobText,
+  opts,
   target,
   forceMode,
   titleText,
@@ -73,6 +78,7 @@ export default function NativeCamera({
   onClose,
   onUseWeb,
 }: Props) {
+  useKeepAwake(); // 撮影画面を開いている間は、画面を暗くしない(三脚で待つとき用)
   const { hasPermission, requestPermission } = useCameraPermission();
   const [mode, setMode] = useState<CamMode>(req.mode);
   const [method, setMethod] = useState<'photo' | 'video'>('photo');
@@ -89,6 +95,13 @@ export default function NativeCamera({
   const [frames, setFrames] = useState<Frame[]>([]);
   const [qrLast, setQrLast] = useState('');
   const [name, setName] = useState('');
+  const [torch, setTorch] = useState(false);
+  const [shot, setShot] = useState<string | null>(null); // 撮った直後の確認待ちの写真
+  const [off, setOff] = useState<string[]>([]); // 合成から外すコマ
+  const [tilt, setTilt] = useState<{ x: number; y: number; flat: boolean } | null>(null);
+  const keyRef = useRef<React.ComponentRef<typeof TextInput>>(null);
+  const actRef = useRef<() => void>(() => {});
+  const nameFocus = useRef(false); // ファイル名を入力中は、キーボード撮影の入力欄にフォーカスを戻さない
   const camRef = useRef<CameraRef>(null);
   const lastQr = useRef({ v: '', at: 0 });
   const qrHandler = useRef<(v: string) => void>(() => {});
@@ -137,20 +150,52 @@ export default function NativeCamera({
   const pos = useMemo(() => positions(steps, range[0], range[1]), [steps, range]);
 
   useEffect(() => {
-    if (savedTick > 0) {
-      setFrames([]);
-      if (req.queue) {
-        setQrLast('');
-        setName('');
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [savedTick]);
-  useEffect(() => {
     if (forceMode && req.modes.includes(forceMode.mode)) setMode(forceMode.mode);
   }, [forceMode, req.modes]);
 
-  const disabled = busy || sending;
+  // 保存は裏で進むので、撮影は止めない。ただし「保存したら閉じる」画面(スキャンなど)は、終わるまで待つ
+  const blocking = jobs > 0 && !req.keepOpen && !req.queue;
+  // 水準器(グリッド表示がオンのときだけ、傾きセンサーを使う)
+  useEffect(() => {
+    if (!opts.grid) {
+      setTilt(null);
+      return;
+    }
+    let sub: { remove: () => void } | null = null;
+    let alive = true;
+    (async () => {
+      try {
+        if (!(await DeviceMotion.isAvailableAsync())) return;
+        DeviceMotion.setUpdateInterval(120);
+        sub = DeviceMotion.addListener((m) => {
+          if (!alive || !m.rotation) return;
+          const deg = (r: number) => (r * 180) / Math.PI;
+          const beta = deg(m.rotation.beta); // 前後の傾き(水平に置くと 0、立てると ±90)
+          const gamma = deg(m.rotation.gamma); // 左右の傾き
+          const flat = Math.abs(beta) < 45;
+          setTilt({ x: gamma, y: flat ? beta : beta - 90 * Math.sign(beta), flat });
+        });
+      } catch {
+        // センサーが使えなければ、水準器は出さない
+      }
+    })();
+    return () => {
+      alive = false;
+      sub?.remove();
+    };
+  }, [opts.grid]);
+
+  // ライト(トーチ): 画面を離れる・モードを変えるときは消す
+  useEffect(() => {
+    const c = camRef.current?.controller;
+    if (!c || !device?.hasTorch) return;
+    c.setTorchMode(torch && mode !== 'qr' ? 'on' : 'off').catch(() => {});
+    return () => {
+      c.setTorchMode('off').catch(() => {});
+    };
+  }, [torch, mode, device]);
+
+  const disabled = busy || blocking || !!shot;
   const outputs = useMemo(
     () => (mode === 'qr' ? [objectOutput] : mode === 'burst' && method === 'video' ? [videoOutput] : [photoOutput]),
     [mode, method, objectOutput, videoOutput, photoOutput],
@@ -181,6 +226,17 @@ export default function NativeCamera({
   const settle = tripod ? 900 : 450;
   const meta: SendMeta = { name: name.trim() || undefined, qr: qrLast || undefined };
 
+  // 1枚を送り(裏で保存される)、すぐ次の撮影に戻れるようにする
+  const sendShot = (path: string) => {
+    onSend('photo', [{ path }], meta);
+    setShot(null);
+    setLocal('');
+    if (req.queue) {
+      setQrLast('');
+      setName('');
+    }
+  };
+
   const shootPhoto = useCallback(async () => {
     if (!device) return;
     setBusy(true);
@@ -188,14 +244,34 @@ export default function NativeCamera({
     try {
       await countdown();
       const pf = await photoOutput.capturePhotoToFile({}, {});
-      onSend('photo', [{ path: pf.filePath }], meta);
+      if (opts.review) {
+        setShot(pf.filePath); // 送る前に確認する
+        setLocal('撮れました。よければ「送る」、だめなら「撮り直す」を押してください。');
+      } else {
+        sendShot(pf.filePath);
+      }
     } catch (e) {
       setLocal('撮影に失敗: ' + (e instanceof Error ? e.message : String(e)));
     } finally {
       setBusy(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [device, photoOutput, onSend, countdown, name, qrLast]);
+  }, [device, photoOutput, onSend, countdown, name, qrLast, opts.review]);
+
+  // ピントを動かす間に明るさ・色が変わると、合成がずれるので固定する(対応しているカメラのみ)
+  const lockLight = async (c: NonNullable<CameraRef['controller']>) => {
+    if (!opts.lockExposure || !device) return;
+    try {
+      if (device.supportsExposureLocking) await c.lockCurrentExposure();
+    } catch {
+      // 固定できなくても撮影は続ける
+    }
+    try {
+      if (device.supportsWhiteBalanceLocking) await c.lockCurrentWhiteBalance();
+    } catch {
+      // 同上
+    }
+  };
 
   const shootBurst = useCallback(async () => {
     const c = camRef.current?.controller;
@@ -209,8 +285,10 @@ export default function NativeCamera({
     }
     setBusy(true);
     setFrames([]);
+    setOff([]);
     try {
       await countdown();
+      await lockLight(c);
       const out: Frame[] = [];
       for (let i = 0; i < pos.length; i++) {
         setLocal(`ピントを動かして撮影中 ${i + 1} / ${pos.length}`);
@@ -246,8 +324,10 @@ export default function NativeCamera({
     }
     setBusy(true);
     setFrames([]);
+    setOff([]);
     try {
       await countdown();
+      await lockLight(c);
       const rec = await videoOutput.createRecorder({});
       let resolveFile!: (p: string) => void;
       let rejectFile!: (e: Error) => void;
@@ -328,14 +408,46 @@ export default function NativeCamera({
     setLocal('手前の端(一番近くで合わせたい所)をタップしてください。次に奥の端をタップします。');
   };
 
+  const sendBurst = () => {
+    const use = frames.filter((f) => !off.includes(f.path));
+    if (use.length < 2) {
+      setLocal('合成には2枚以上が必要です。');
+      return;
+    }
+    onSend('burst', use.map((f) => ({ path: f.path })), meta);
+    setFrames([]);
+    setOff([]);
+    setLocal('');
+    if (req.queue) {
+      setQrLast('');
+      setName('');
+    }
+  };
+
   const mainLabel =
     mode === 'photo'
-      ? disabled
-        ? '処理中…'
+      ? busy
+        ? '撮影中…'
         : req.queue
           ? '撮影して端末に保存'
           : '撮影して保存'
       : '';
+
+  // 外部キーボードのスペース / Enter で、いま画面に出ている主なボタンを押す
+  actRef.current = () => {
+    if (!device || !hasPermission) return;
+    if (shot) {
+      sendShot(shot);
+      return;
+    }
+    if (disabled) return;
+    if (mode === 'photo') shootPhoto();
+    else if (mode === 'burst') {
+      if (frames.length > 0) sendBurst();
+      else if (method === 'photo') shootBurst();
+      else shootVideo();
+    }
+  };
 
   return (
     <Modal visible animationType="slide" presentationStyle="fullScreen" onRequestClose={onClose}>
@@ -380,7 +492,55 @@ export default function NativeCamera({
                     <Text style={s.pickT}>QRコードを写してください</Text>
                   </View>
                 )}
+                {opts.grid && mode !== 'qr' && (
+                  <View style={StyleSheet.absoluteFill} pointerEvents="none">
+                    <View style={[s.gv, { left: '33.3%' }]} />
+                    <View style={[s.gv, { left: '66.6%' }]} />
+                    <View style={[s.gh, { top: '33.3%' }]} />
+                    <View style={[s.gh, { top: '66.6%' }]} />
+                    {tilt && (
+                      <View style={s.lvBox}>
+                        <View style={s.lvRing} />
+                        <View
+                          style={[
+                            s.lvDot,
+                            {
+                              backgroundColor: Math.abs(tilt.x) < 2 && Math.abs(tilt.y) < 2 ? '#43e05c' : '#ffd24a',
+                              transform: [{ translateX: clamp(tilt.x, -30, 30) * 1.2 }, { translateY: clamp(tilt.y, -30, 30) * 1.2 }],
+                            },
+                          ]}
+                        />
+                        <Text style={s.lvT}>
+                          {tilt.flat ? '水平' : '垂直'} 左右{Math.round(tilt.x)}° 前後{Math.round(tilt.y)}°
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+                )}
+                {jobs > 0 && (
+                  <View style={s.jobBadge} pointerEvents="none">
+                    <Text style={s.pickT}>{jobText || `保存中 ${jobs}件`}</Text>
+                  </View>
+                )}
               </View>
+              {opts.keyShutter && (
+                <TextInput
+                  ref={keyRef}
+                  autoFocus
+                  value=""
+                  onChangeText={() => {}}
+                  onKeyPress={(e) => {
+                    const k = e.nativeEvent.key;
+                    if (k === ' ' || k === 'Enter') actRef.current();
+                  }}
+                  onSubmitEditing={() => actRef.current()}
+                  onBlur={() => setTimeout(() => !nameFocus.current && keyRef.current?.focus(), 400)}
+                  showSoftInputOnFocus={false}
+                  caretHidden
+                  blurOnSubmit={false}
+                  style={s.keyIn}
+                />
+              )}
               <Text style={s.diag}>
                 {device ? `${device.localizedName} / 倍率 ${fmtZ(curZoom / baseZoom)}` : '-'}
                 {device ? ` [レンズ${device.physicalDevices.length} 切替${(device.zoomLensSwitchFactors ?? []).join(',') || 'なし'} ズーム${device.minZoom}〜${device.maxZoom}]` : ''}
@@ -435,6 +595,7 @@ export default function NativeCamera({
                       {[0, 3, 10].map((t) => (
                         <Chip key={t} label={t === 0 ? 'タイマーなし' : `${t}秒`} on={timer === t} onPress={() => !disabled && setTimer(t)} />
                       ))}
+                      {device?.hasTorch && <Chip label={torch ? 'ライト: オン' : 'ライト: オフ'} on={torch} onPress={() => setTorch(!torch)} />}
                     </View>
                   </>
                 )}
@@ -442,7 +603,19 @@ export default function NativeCamera({
                 {req.queue && mode !== 'qr' && (
                   <>
                     <Text style={s.label}>ファイル名(任意)</Text>
-                    <TextInput value={name} onChangeText={setName} style={s.input} placeholder="例: ○○の株元" />
+                    <TextInput
+                      value={name}
+                      onChangeText={setName}
+                      style={s.input}
+                      placeholder="例: ○○の株元"
+                      onFocus={() => {
+                        nameFocus.current = true;
+                      }}
+                      onBlur={() => {
+                        nameFocus.current = false;
+                        if (opts.keyShutter) setTimeout(() => keyRef.current?.focus(), 400);
+                      }}
+                    />
                   </>
                 )}
 
@@ -488,7 +661,22 @@ export default function NativeCamera({
                   </>
                 )}
 
-                {mode === 'photo' && <Btn label={mainLabel} onPress={shootPhoto} disabled={disabled || !device} />}
+                {mode === 'photo' && shot && (
+                  <>
+                    <Image source={{ uri: 'file://' + shot }} style={s.reviewImg} resizeMode="contain" />
+                    <Btn label={req.queue ? '端末に保存する' : '送る'} onPress={() => sendShot(shot)} />
+                    <Pressable
+                      onPress={() => {
+                        setShot(null);
+                        setLocal('');
+                      }}
+                      style={s.btn2}
+                    >
+                      <Text style={s.btn2T}>撮り直す</Text>
+                    </Pressable>
+                  </>
+                )}
+                {mode === 'photo' && !shot && <Btn label={mainLabel} onPress={shootPhoto} disabled={disabled || !device} />}
                 {mode === 'burst' && (
                   <>
                     <Btn
@@ -498,25 +686,29 @@ export default function NativeCamera({
                     />
                     {frames.length > 0 && (
                       <>
+                        <Text style={s.hint}>ぶれたコマは、タップすると合成から外せます(残り {frames.length - off.length}枚)</Text>
                         <View style={s.row}>
-                          {frames.map((f) => (
-                            <View key={f.path} style={s.thumbBox}>
-                              <Image source={{ uri: 'file://' + f.path }} style={s.thumb} />
-                              <Text style={s.cap}>{f.label}</Text>
-                            </View>
-                          ))}
+                          {frames.map((f) => {
+                            const x = off.includes(f.path);
+                            return (
+                              <Pressable key={f.path} style={s.thumbBox} onPress={() => setOff(x ? off.filter((p) => p !== f.path) : [...off, f.path])}>
+                                <Image source={{ uri: 'file://' + f.path }} style={[s.thumb, x && { opacity: 0.25 }]} />
+                                <Text style={s.cap}>{x ? '外す' : f.label}</Text>
+                              </Pressable>
+                            );
+                          })}
                         </View>
                         <Btn
                           label={req.queue ? 'ピント合成用に端末へ保存' : 'ピント合成して保存'}
-                          onPress={() => onSend('burst', frames.map((f) => ({ path: f.path })), meta)}
-                          disabled={disabled}
+                          onPress={sendBurst}
+                          disabled={disabled || frames.length - off.length < 2}
                         />
                       </>
                     )}
                   </>
                 )}
 
-                {(busy || sending) && <ActivityIndicator />}
+                {(busy || blocking) && <ActivityIndicator />}
                 {!!local && <Text style={s.msg}>{local}</Text>}
                 {!!message.text && <Text style={[s.msg, message.error && { color: '#b00020' }]}>{message.text}</Text>}
 
@@ -572,6 +764,17 @@ const s = StyleSheet.create({
   chip: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 18, borderWidth: 1, borderColor: '#2e7d32', backgroundColor: '#fff' },
   chipOn: { backgroundColor: '#2e7d32' },
   chipT: { color: '#2e7d32', fontWeight: '600' },
+  gv: { position: 'absolute', top: 0, bottom: 0, width: 1, backgroundColor: 'rgba(255,255,255,0.45)' },
+  gh: { position: 'absolute', left: 0, right: 0, height: 1, backgroundColor: 'rgba(255,255,255,0.45)' },
+  lvBox: { position: 'absolute', alignSelf: 'center', top: '38%', alignItems: 'center', justifyContent: 'center', width: 90, height: 90 },
+  lvRing: { position: 'absolute', width: 60, height: 60, borderRadius: 30, borderWidth: 2, borderColor: 'rgba(255,255,255,0.8)' },
+  lvDot: { width: 14, height: 14, borderRadius: 7 },
+  lvT: { position: 'absolute', top: 94, color: '#fff', fontSize: 11, backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 6, borderRadius: 6, overflow: 'hidden' },
+  jobBadge: { position: 'absolute', left: 8, bottom: 8 },
+  keyIn: { position: 'absolute', width: 1, height: 1, opacity: 0, left: 0, top: 0 },
+  reviewImg: { width: '100%', height: 220, backgroundColor: '#000', borderRadius: 8 },
+  btn2: { padding: 12, borderRadius: 10, alignItems: 'center', borderWidth: 1, borderColor: '#2e7d32', backgroundColor: '#fff' },
+  btn2T: { color: '#2e7d32', fontWeight: '600' },
   thumbBox: { width: '23%' },
   thumb: { width: '100%', aspectRatio: 3 / 4, borderRadius: 6, backgroundColor: '#ddd' },
   cap: { fontSize: 9, color: '#344' },

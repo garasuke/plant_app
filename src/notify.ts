@@ -3,6 +3,8 @@
 // 予約はアプリを開いたとき(または前面に戻ったとき)に作り直す。圏外のあいだは、前回の予約がそのまま鳴る。
 import * as Notifications from 'expo-notifications';
 
+import { EXPIRY_ID } from './expiry';
+
 export type NotifyItem = { title: string; date: string; level?: string; kind_label?: string; sub?: string };
 
 Notifications.setNotificationHandler({
@@ -16,10 +18,20 @@ export async function ensureNotifyPermission(): Promise<boolean> {
   return r.granted;
 }
 
+export async function hasNotifyPermission(): Promise<boolean> {
+  return (await Notifications.getPermissionsAsync()).granted;
+}
+
 const ymd = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
+// 予定の通知だけを消す(アプリの期限の通知は残す)
+async function cancelPlans(): Promise<void> {
+  const all = await Notifications.getAllScheduledNotificationsAsync();
+  for (const n of all) if (n.identifier !== EXPIRY_ID) await Notifications.cancelScheduledNotificationAsync(n.identifier);
+}
+
 export async function scheduleFromItems(items: NotifyItem[], hour: number, days: number): Promise<number> {
-  await Notifications.cancelAllScheduledNotificationsAsync();
+  await cancelPlans();
   const now = new Date();
   const today = ymd(now);
   const groups = new Map<string, NotifyItem[]>();
@@ -60,5 +72,5 @@ export async function scheduleFromItems(items: NotifyItem[], hour: number, days:
 }
 
 export async function cancelAllNotify(): Promise<void> {
-  await Notifications.cancelAllScheduledNotificationsAsync();
+  await cancelPlans();
 }

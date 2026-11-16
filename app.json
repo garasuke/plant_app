@@ -2,7 +2,7 @@
   "expo": {
     "name": "植物管理",
     "slug": "plantclient",
-    "version": "3.0.0",
+    "version": "3.4.0",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -21,7 +21,26 @@
       }
     },
     "plugins": [
-      "expo-quick-actions"
+      "expo-quick-actions",
+      [
+        "expo-media-library",
+        {
+          "savePhotosPermission": "撮った写真を写真アプリにも保存するために使います",
+          "photosPermission": false
+        }
+      ],
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "アプリを開くときに本人確認するために Face ID を使います"
+        }
+      ],
+      [
+        "expo-sensors",
+        {
+          "motionPermission": "撮影画面の水準器(傾きの表示)に使います"
+        }
+      ]
     ]
   }
 }

@@ -5,6 +5,7 @@
 //  ・撮影場所の記録 / 予定・期限の通知 / ホーム画面アイコン長押しからの起動
 //  ・調べもの画面(iPad は分割表示)と、長押しメニュー(一時メモ・ファイル管理へ保存)
 import { Directory, File, Paths } from 'expo-file-system';
+import * as LocalAuthentication from 'expo-local-authentication';
 import * as Location from 'expo-location';
 import * as QuickActions from 'expo-quick-actions';
 import { StatusBar } from 'expo-status-bar';
@@ -30,9 +31,15 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
 
 import { DEFAULT_SETTINGS, DEFAULT_URL, loadSettings, saveSettings, type Settings } from './src/config';
+import { BUILD_AT, BUILD_SHA } from './src/buildinfo';
+import { daysLeft, readExpiry, scheduleExpiry } from './src/expiry';
 import { INJECT_BEFORE } from './src/inject';
+import { clearLog, logError, logInfo, readLog, type LogEntry } from './src/log';
 import NativeCamera, { type CamMode, type CamRequest, type Msg, type SendMeta, type Taken } from './src/NativeCamera';
-import { cancelAllNotify, ensureNotifyPermission, scheduleFromItems, type NotifyItem } from './src/notify';
+import { saveToPhotos } from './src/photos';
+import { shrinkIfNeeded } from './src/resize';
+import appJson from './app.json';
+import { cancelAllNotify, ensureNotifyPermission, hasNotifyPermission, scheduleFromItems, type NotifyItem } from './src/notify';
 import { itemFileUri, queueAdd, queueList, queueRemove, queueUpdate, type QItem } from './src/queue';
 import ResearchBrowser, { type CtxInfo, type PageInfo } from './src/ResearchBrowser';
 
@@ -58,8 +65,8 @@ export default function App() {
 
   const [req, setReq] = useState<CamRequest | null>(null);
   const [camMsg, setCamMsg] = useState<Msg>({ text: '' });
-  const [sending, setSending] = useState(false);
-  const [savedTick, setSavedTick] = useState(0);
+  const [jobCount, setJobCount] = useState(0); // 裏で保存している撮影の数
+  const [jobText, setJobText] = useState('');
   const [camTarget, setCamTarget] = useState('');
   const [camTitle, setCamTitle] = useState('');
   const [forceMode, setForceMode] = useState<{ mode: CamMode; tick: number } | null>(null);
@@ -94,6 +101,34 @@ export default function App() {
   const geoSub = useRef<Location.LocationSubscription | null>(null);
   const wide = width >= 700;
 
+  // 裏で保存する撮影の順番待ち(撮影は止めずに、1件ずつ順に送る)
+  type Job = {
+    id: string;
+    sid: string; // ページ側のカメラ画面の番号
+    kind: 'photo' | 'burst';
+    paths: string[];
+    geo: { lat: number; lng: number; acc: number } | null;
+    extra: Record<string, string>; // 保存先(フォルダ・記録)。失敗して「未送信」に残すとき使う
+    cid: string;
+    blocking: boolean; // 保存したらカメラを閉じる画面(スキャンなど)
+    name?: string;
+    qr?: string;
+  };
+  const jobQ = useRef<Job[]>([]);
+  const jobRun = useRef<Job | null>(null);
+  const jobWait = useRef<{ job: string; done: (r: { ok: boolean; err?: string; unknown?: boolean }) => void } | null>(null);
+  const camMeta = useRef<Record<string, string>>({});
+  const deferClose = useRef<string | null>(null);
+  const photoWarned = useRef(false);
+  const jobDone = useRef(0);
+  const [lastOk, setLastOk] = useState(0);
+  const [expiry, setExpiry] = useState<Date | null>(null);
+  const [showDiag, setShowDiag] = useState(false);
+  const [diagLog, setDiagLog] = useState<LogEntry[]>([]);
+  const [diagNet, setDiagNet] = useState('');
+  const [locked, setLocked] = useState(false);
+  const bgAt = useRef(0);
+
   const toast = useCallback((t: string) => {
     setToastT(t);
     setTimeout(() => setToastT((c) => (c === t ? '' : c)), 4000);
@@ -103,8 +138,32 @@ export default function App() {
     loadSettings().then((s) => {
       setSettings(s);
       setDraft(s);
+      if (s.faceLock) setLocked(true);
+    });
+    readExpiry().then(async (d) => {
+      setExpiry(d);
+      // 通知の許可がすでにあるときだけ、期限の前日の通知を予約する(許可は設定の「保存して開く」で求める)
+      if (await hasNotifyPermission()) scheduleExpiry(d, settingsRef.current.expiryNotify).catch(() => {});
     });
   }, []);
+
+  // ---------- Face ID(または passcode)でアプリを開く ----------
+  const unlock = useCallback(async () => {
+    try {
+      const lv = await LocalAuthentication.getEnrolledLevelAsync();
+      if (lv === LocalAuthentication.SecurityLevel.NONE) {
+        setLocked(false); // 端末に passcode などがなければ、確認のしようがないので開く
+        return;
+      }
+      const r = await LocalAuthentication.authenticateAsync({ promptMessage: '植物管理を開く', cancelLabel: 'やめる' });
+      if (r.success) setLocked(false);
+    } catch (e) {
+      logError('Face ID の確認でエラー: ' + errMsg(e));
+    }
+  }, []);
+  useEffect(() => {
+    if (locked) unlock();
+  }, [locked, unlock]);
 
   const js = useCallback((code: string) => webRef.current?.injectJavaScript(code + ';true;'), []);
 
@@ -150,7 +209,10 @@ export default function App() {
       try {
         if (workLoaded.current) {
           const d = await call('ping', {}, 8000);
-          if (d && d.csrf && d.cam) return true;
+          if (d && d.csrf && d.cam) {
+            setLastOk(Date.now());
+            return true;
+          }
         }
       } catch {
         // 読み込み直す
@@ -178,10 +240,11 @@ export default function App() {
       if (!manual && Date.now() - lastFail.current < 60000) return;
       syncing.current = true;
       try {
-        const items = await refreshPending();
+        const all = await refreshPending();
+        const items = all.filter((i) => !i.hold); // 手動で確認するもの(hold)は、自動では送らない
         if (!items.length) {
           if (manual) toast('送る分はありません');
-          setSyncMsg('');
+          setSyncMsg(all.length ? `未送信 ${all.length}件(確認待ち。「未送信の撮影」から操作してください)` : '');
           return;
         }
         if (manual) setSyncMsg(`未送信 ${items.length}件: 接続を確認しています…`);
@@ -197,7 +260,7 @@ export default function App() {
           const it = items[n];
           setSyncMsg(`送信中 ${n + 1} / ${items.length}…`);
           try {
-            const extra: Record<string, string> = {};
+            const extra: Record<string, string> = { ...(it.extra || {}), client_id: it.cid || it.id };
             if (it.qr) {
               const d = await call('lookup', { text: it.qr });
               if (d && d.id) {
@@ -209,14 +272,18 @@ export default function App() {
             const base = stampOf(it.at);
             for (let i = 0; i < it.files.length; i++) {
               const nm = it.kind === 'photo' ? `camera_${base}.jpg` : `focus_${base}_${i + 1}.jpg`;
-              await putFile(it.id, i, nm, 'image/jpeg', itemFileUri(it, i));
+              // 写真は、設定した大きさに縮めて送る(ピント合成の連写は、画質のためそのまま)
+              const src = it.kind === 'photo' ? await shrinkIfNeeded(itemFileUri(it, i), settingsRef.current.sendSize) : itemFileUri(it, i);
+              await putFile(it.id, i, nm, 'image/jpeg', src.startsWith('file://') ? src : 'file://' + src);
             }
             await call(it.kind === 'photo' ? 'upload' : 'stack', { key: it.id, extra, geo: it.geo }, 240000);
             queueRemove(it.id);
+            logInfo(`未送信を送りました(${it.kind === 'photo' ? '写真' : 'ピント合成'})`);
             ok++;
           } catch (e) {
             ng++;
             const m = errMsg(e);
+            logError('未送信の送信に失敗: ' + m);
             it.tries += 1;
             it.error = m;
             await queueUpdate(it);
@@ -228,6 +295,7 @@ export default function App() {
         }
         const left = await refreshPending();
         setSyncMsg(left.length ? `未送信 ${left.length}件(あとで自動で再送します)` : '');
+        if (!left.length) jobDone.current = 0;
         if (manual || ok) toast(`送信: ${ok}件 完了${ng ? ` / ${ng}件 失敗` : ''}`);
       } finally {
         syncing.current = false;
@@ -320,7 +388,6 @@ export default function App() {
   const openQuick = useCallback(
     (mode: CamMode) => {
       setCamMsg({ text: '' });
-      setSending(false);
       setCamTarget('');
       setCamTitle('');
       setForceMode({ mode, tick: Date.now() });
@@ -330,14 +397,124 @@ export default function App() {
     [startGeo],
   );
 
+  const uiJobs = useCallback(() => {
+    const n = jobQ.current.length + (jobRun.current ? 1 : 0);
+    setJobCount(n);
+    setJobText(n > 0 ? `裏で保存中 ${n}件(続けて撮れます)` : '');
+  }, []);
+
+  // 保存の待ちがなくなったら、閉じるのを先送りしていたページ側のカメラ画面を片付ける
+  const flushDeferredClose = useCallback(() => {
+    if (jobRun.current || jobQ.current.length || !deferClose.current) return;
+    const id = deferClose.current;
+    deferClose.current = null;
+    js(`window.__nc&&window.__nc.closed(${JSON.stringify(id)})`);
+  }, [js]);
+
   const closeCam = useCallback(() => {
     const r = reqRef.current;
     setReq(null);
-    setSending(false);
     stopGeo();
-    if (r && r.id !== 'quick') js(`window.__nc&&window.__nc.closed(${JSON.stringify(r.id)})`);
+    if (r && r.id !== 'quick') {
+      if (jobRun.current || jobQ.current.length) deferClose.current = r.id; // 保存が終わってから閉じる
+      else js(`window.__nc&&window.__nc.closed(${JSON.stringify(r.id)})`);
+    }
     if (r && r.id === 'quick') syncQueue();
   }, [js, stopGeo, syncQueue]);
+
+  const resolveJob = useCallback((job: string | undefined, r: { ok: boolean; err?: string; unknown?: boolean }) => {
+    const w = jobWait.current;
+    if (!w || (job && w.job !== job)) return;
+    jobWait.current = null;
+    w.done(r);
+  }, []);
+
+  // 1件の送信: 写真を(必要なら縮めて)ページへ渡し、サーバーに受け取られるのを待つ
+  const runJob = useCallback(
+    async (job: Job): Promise<{ ok: boolean; err?: string; unknown?: boolean }> => {
+      const st = settingsRef.current;
+      const waiting = new Promise<{ ok: boolean; err?: string; unknown?: boolean }>((res) => {
+        const timer = setTimeout(() => {
+          if (jobWait.current && jobWait.current.job === job.id) {
+            jobWait.current = null;
+            res({ ok: false, unknown: true, err: '応答がありませんでした(サーバーには届いている可能性があります)' });
+          }
+        }, 240000);
+        jobWait.current = {
+          job: job.id,
+          done: (r) => {
+            clearTimeout(timer);
+            res(r);
+          },
+        };
+      });
+      try {
+        js(job.geo ? `window.__nc.geo(${JSON.stringify(job.geo)})` : 'window.__nc.geo(null)');
+        const base = stampOf(Date.now());
+        for (let i = 0; i < job.paths.length; i++) {
+          const src = job.kind === 'photo' ? await shrinkIfNeeded(job.paths[i], st.sendSize) : job.paths[i];
+          const b64 = await new File(src.startsWith('file://') ? src : 'file://' + src).base64();
+          const name = job.kind === 'photo' ? `camera_${base}.jpg` : `focus_${base}_${i + 1}.jpg`;
+          js(
+            `window.__nc.recv(${JSON.stringify(job.sid)},${JSON.stringify(job.kind)},${i},${job.paths.length},${JSON.stringify(name)},"image/jpeg",${JSON.stringify(b64)},${JSON.stringify(job.id)})`,
+          );
+        }
+      } catch (e) {
+        resolveJob(job.id, { ok: false, err: '送信の準備に失敗: ' + errMsg(e) });
+      }
+      return waiting;
+    },
+    [js, resolveJob],
+  );
+
+  const pumpJobs = useCallback(async () => {
+    if (jobRun.current) return;
+    const job = jobQ.current.shift();
+    if (!job) {
+      uiJobs();
+      flushDeferredClose();
+      return;
+    }
+    jobRun.current = job;
+    uiJobs();
+    let res: { ok: boolean; err?: string; unknown?: boolean };
+    try {
+      res = await runJob(job);
+    } catch (e) {
+      res = { ok: false, err: errMsg(e) };
+    }
+    jobRun.current = null;
+    if (res.ok) {
+      jobDone.current += 1;
+      logInfo(`保存しました(${job.kind === 'photo' ? '写真' : 'ピント合成'})`);
+      setCamMsg({ text: `保存しました(${jobDone.current}件完了)` });
+      if (job.blocking && !reqRef.current?.keepOpen) closeCam();
+    } else if (job.blocking) {
+      logError('保存できませんでした: ' + (res.err || ''));
+      setCamMsg({ text: '保存できませんでした: ' + (res.err || ''), error: true });
+    } else {
+      // 失敗しても撮ったものは消さない。「未送信」に残し、確認してから送れるようにする
+      logError('保存できなかった撮影を未送信に残しました: ' + (res.err || ''));
+      try {
+        await queueAdd(job.kind, job.paths, {
+          name: job.name,
+          qr: job.qr,
+          geo: job.geo ?? undefined,
+          cid: job.cid,
+          extra: job.extra,
+          hold: true,
+          error: res.unknown ? '送れたか分かりません。ファイル管理を確認してから「送る」を押してください(重複に注意)' : res.err || 'うまくいきませんでした',
+        });
+        await refreshPending();
+        setCamMsg({ text: '保存できませんでした。撮った写真は「未送信の撮影」に残してあります。' + (res.err ? '(' + res.err + ')' : ''), error: true });
+        toast('保存できなかった撮影を、未送信に残しました');
+      } catch (e) {
+        setCamMsg({ text: '保存できず、端末にも残せませんでした: ' + errMsg(e), error: true });
+      }
+    }
+    uiJobs();
+    pumpJobs();
+  }, [closeCam, flushDeferredClose, refreshPending, runJob, toast, uiJobs]);
 
   const onMessage = useCallback(
     (ev: WebViewMessageEvent) => {
@@ -348,13 +525,19 @@ export default function App() {
         return;
       }
       const cur = reqRef.current;
+      const metaOf = (x: any): Record<string, string> => {
+        const o: Record<string, string> = {};
+        if (x && typeof x === 'object') for (const k of Object.keys(x)) if (x[k] !== undefined && x[k] !== null && String(x[k]) !== '') o[k] = String(x[k]);
+        return o;
+      };
       switch (m.t) {
         case 'open':
           setCamMsg({ text: '' });
-          setSending(false);
           setCamTarget(m.target || '');
           setCamTitle('');
           setForceMode(null);
+          camMeta.current = metaOf(m.meta);
+          jobDone.current = 0;
           setReq({ id: m.id, title: m.title, modes: m.modes, mode: m.mode, keepOpen: !!m.keepOpen, hasWeb: !!m.hasWeb });
           startGeo();
           break;
@@ -371,7 +554,10 @@ export default function App() {
           if (cur && m.id === cur.id) setCamTitle(String(m.title || ''));
           break;
         case 'target':
-          if (cur && m.id === cur.id) setCamTarget(String(m.name || ''));
+          if (cur && m.id === cur.id) {
+            setCamTarget(String(m.name || ''));
+            camMeta.current = metaOf(m.meta);
+          }
           break;
         case 'dlstart':
           toast('ファイルを取得しています…');
@@ -382,57 +568,71 @@ export default function App() {
         case 'dlerr':
           toast('ダウンロードできませんでした: ' + String(m.msg || ''));
           break;
+        case 'sent':
+          // サーバーが受け取った(ページ側の一覧の再読み込みなどは待たない)
+          resolveJob(m.job, m.ok ? { ok: true } : { ok: false, err: String(m.msg || 'サーバーが受け付けませんでした') });
+          break;
         case 'saved':
-          setSending(false);
-          setSavedTick((t) => t + 1);
-          setCamMsg({ text: '保存しました。' });
-          if (!reqRef.current?.keepOpen) closeCam();
+          resolveJob(m.job, { ok: true });
           break;
         case 'error':
-          setSending(false);
-          setCamMsg({ text: '保存できませんでした: ' + String(m.msg || ''), error: true });
+          resolveJob(m.job, { ok: false, err: String(m.msg || '') });
           break;
       }
     },
-    [closeCam, startGeo, toast],
+    [closeCam, resolveJob, startGeo, toast],
   );
 
+  // 撮影が終わるたびに呼ばれる。ここでは待たずに順番待ちへ入れ、すぐ次の撮影に戻れるようにする
   const onSend = useCallback(
-    async (kind: 'photo' | 'burst', files: Taken[], meta: SendMeta) => {
+    (kind: 'photo' | 'burst', files: Taken[], meta: SendMeta) => {
       const r = reqRef.current;
       if (!r) return;
-      setSending(true);
-      try {
-        const g = await getGeo();
-        if (r.queue) {
-          await queueAdd(kind, files.map((f) => f.path), {
-            name: meta.name,
-            qr: meta.qr,
-            geo: g ? { lat: g.lat, lng: g.lng, acc: g.acc } : undefined,
-          });
-          const l = await refreshPending();
-          setSavedTick((t) => t + 1);
-          setSending(false);
-          setCamMsg({ text: `端末に保存しました(未送信 ${l.length}件)。つながると自動で送ります。` });
-          syncQueue();
-          return;
-        }
-        setCamMsg({ text: 'サーバーへ送っています…' });
-        js(g ? `window.__nc.geo(${JSON.stringify({ lat: g.lat, lng: g.lng, acc: g.acc })})` : 'window.__nc.geo(null)');
-        const base = stampOf(Date.now());
-        for (let i = 0; i < files.length; i++) {
-          const b64 = await new File('file://' + files[i].path).base64();
-          const name = kind === 'photo' ? `camera_${base}.jpg` : `focus_${base}_${i + 1}.jpg`;
-          js(
-            `window.__nc.recv(${JSON.stringify(r.id)},${JSON.stringify(kind)},${i},${files.length},${JSON.stringify(name)},"image/jpeg",${JSON.stringify(b64)})`,
-          );
-        }
-      } catch (e) {
-        setSending(false);
-        setCamMsg({ text: '送信の準備に失敗: ' + errMsg(e), error: true });
+      const paths = files.map((f) => f.path);
+      const st = settingsRef.current;
+      if (st.savePhotos && kind === 'photo') {
+        saveToPhotos(paths[0]).then((ok) => {
+          if (!ok && !photoWarned.current) {
+            photoWarned.current = true;
+            toast('写真アプリに保存できませんでした(iPhoneの設定で、写真への追加を許可してください)');
+          }
+        });
       }
+      if (r.queue) {
+        // 圏外用: 端末に貯める(すぐ終わる)
+        (async () => {
+          try {
+            const g = await getGeo();
+            await queueAdd(kind, paths, { name: meta.name, qr: meta.qr, geo: g ? { lat: g.lat, lng: g.lng, acc: g.acc } : undefined });
+            const l = await refreshPending();
+            setCamMsg({ text: `端末に保存しました(未送信 ${l.length}件)。つながると自動で送ります。` });
+            syncQueue();
+          } catch (e) {
+            logError('端末への保存に失敗: ' + errMsg(e));
+            setCamMsg({ text: '端末に保存できませんでした: ' + errMsg(e), error: true });
+          }
+        })();
+        return;
+      }
+      (async () => {
+        const g = await getGeo();
+        jobQ.current.push({
+          id: 'j' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+          sid: r.id,
+          kind,
+          paths,
+          geo: g ? { lat: g.lat, lng: g.lng, acc: g.acc } : null,
+          extra: { ...camMeta.current },
+          cid: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+          blocking: !r.keepOpen,
+          name: meta.name,
+          qr: meta.qr,
+        });
+        uiJobs();
+        pumpJobs();
+      })();
     },
-    [getGeo, js, refreshPending, syncQueue],
+    [getGeo, pumpJobs, refreshPending, syncQueue, toast, uiJobs],
   );
 
   const onQR = useCallback(
@@ -446,7 +646,6 @@ export default function App() {
   const onUseWeb = useCallback(() => {
     const r = reqRef.current;
     setReq(null);
-    setSending(false);
     stopGeo();
     if (r) js(`window.__nc&&window.__nc.useweb(${JSON.stringify(r.id)},"video")`);
   }, [js, stopGeo]);
@@ -618,7 +817,11 @@ export default function App() {
   useEffect(() => {
     refreshPending();
     const sub = AppState.addEventListener('change', (st) => {
+      if (st === 'background') bgAt.current = Date.now();
       if (st !== 'active') return;
+      // 1分以上はなれていたら、もう一度 Face ID を求める
+      if (settingsRef.current.faceLock && bgAt.current && Date.now() - bgAt.current > 60000) setLocked(true);
+      bgAt.current = 0;
       if (loadErr) webRef.current?.reload();
       syncQueue();
       if (Date.now() - lastNotify.current > 30 * 60 * 1000) refreshNotify();
@@ -659,7 +862,44 @@ export default function App() {
     workLoaded.current = false;
     if (!next.notify) cancelAllNotify();
     else refreshNotify(true);
+    // 署名の期限の前日の通知(許可がなければここで求める)
+    (async () => {
+      if (next.expiryNotify) await ensureNotifyPermission().catch(() => false);
+      await scheduleExpiry(expiry, next.expiryNotify).catch(() => {});
+    })();
   };
+
+  const openDiag = useCallback(() => {
+    setDiagLog(readLog());
+    setDiagNet('');
+    setShowDiag(true);
+  }, []);
+  const testNet = useCallback(async () => {
+    setDiagNet('確認中…');
+    try {
+      const ok = await ensureWorker();
+      setDiagNet(ok ? 'つながっています(ログイン済み)' : 'つながりません(VPN・ログインを確認してください)');
+    } catch (e) {
+      setDiagNet('確認できませんでした: ' + errMsg(e));
+    }
+    setDiagLog(readLog());
+  }, [ensureWorker]);
+
+  // 未送信の撮影を、写真アプリへ退避する(アプリを消す前・期限が切れる前の保険)
+  const rescueToPhotos = useCallback(
+    async (items: QItem[]) => {
+      let ok = 0;
+      let ng = 0;
+      for (const it of items) {
+        for (let i = 0; i < it.files.length; i++) {
+          if (await saveToPhotos(itemFileUri(it, i))) ok++;
+          else ng++;
+        }
+      }
+      toast(ng ? `写真アプリへ ${ok}枚 保存 / ${ng}枚 失敗(写真への追加の許可を確認してください)` : `写真アプリへ ${ok}枚 保存しました`);
+    },
+    [toast],
+  );
 
   if (!settings) {
     return (
@@ -713,6 +953,15 @@ export default function App() {
         <View style={s.rowFill}>
           <View style={{ flex: 1 }}>
             {mainWeb}
+            {!!expiry && daysLeft(expiry) <= 2 && (
+              <View style={s.expiry}>
+                <Text style={s.expiryT}>
+                  {daysLeft(expiry) < 0
+                    ? 'アプリの期限が切れています。パソコンの Sideloadly で入れ直してください。'
+                    : `アプリの期限まであと${daysLeft(expiry)}日です。${pending > 0 ? '未送信があるので、先に送るか写真アプリへ退避してください。' : 'Sideloadly で入れ直してください。'}`}
+                </Text>
+              </View>
+            )}
             {!!syncMsg && (
               <Pressable style={s.sync} onPress={() => { refreshPending(); setShowQueue(true); }}>
                 <Text style={s.syncT}>{syncMsg}</Text>
@@ -806,8 +1055,9 @@ export default function App() {
           <NativeCamera
             req={req}
             message={camMsg}
-            sending={sending}
-            savedTick={savedTick}
+            jobs={jobCount}
+            jobText={jobText}
+            opts={{ review: settings.review, grid: settings.grid, keyShutter: settings.keyShutter, lockExposure: settings.lockExposure }}
             target={camTarget}
             forceMode={forceMode}
             titleText={camTitle}
@@ -842,7 +1092,20 @@ export default function App() {
                       {it.name ? ` 「${it.name}」` : ''}
                       {it.qr ? ' QR付き' : ''}
                       {it.error ? `\n⚠ ${it.error}` : ''}
+                      {it.hold ? '\n(自動では送りません)' : ''}
                     </Text>
+                    {it.hold && (
+                      <Pressable
+                        onPress={async () => {
+                          it.hold = false;
+                          await queueUpdate(it);
+                          await refreshPending();
+                          syncQueue(true);
+                        }}
+                      >
+                        <Text style={{ color: '#2e7d32' }}>送る</Text>
+                      </Pressable>
+                    )}
                     <Pressable
                       onPress={() =>
                         Alert.alert('削除しますか', 'この撮影は送信されずに消えます。', [
@@ -859,6 +1122,12 @@ export default function App() {
               <Pressable style={s.btn} onPress={() => syncQueue(true)}>
                 <Text style={s.btnT}>今すぐ送る</Text>
               </Pressable>
+              {queueItems.length > 0 && (
+                <Pressable style={s.btn2} onPress={() => rescueToPhotos(queueItems)}>
+                  <Text style={s.btn2T}>すべて写真アプリへ退避する</Text>
+                </Pressable>
+              )}
+              <Text style={s.hint}>アプリを削除すると、未送信の撮影は消えます。消す前に、送るか写真アプリへ退避してください。</Text>
               <Pressable style={s.btn2} onPress={() => setShowQueue(false)}>
                 <Text style={s.btn2T}>閉じる</Text>
               </Pressable>
@@ -911,8 +1180,60 @@ export default function App() {
                     <Text style={s.hint}>通知は、アプリを開いたときに予約し直します。圏外のあいだは前回の予約が鳴ります。</Text>
                   </>
                 )}
+                <Text style={[s.h, { fontSize: 15, marginTop: 6 }]}>撮影</Text>
+                <Text style={s.lbl}>送る写真の大きさ(長辺)</Text>
+                <View style={s.chips}>
+                  {([['orig', 'そのまま'], ['2048', '2048px'], ['1280', '1280px']] as const).map(([v, t]) => (
+                    <Pressable key={v} style={[s.chip, draft.sendSize === v && s.chipOn]} onPress={() => setDraft({ ...draft, sendSize: v })}>
+                      <Text style={[s.chipT, draft.sendSize === v && { color: '#fff' }]}>{t}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <Text style={s.hint}>VPN で遅いときは小さくします。ピント合成の連写は、画質のためそのまま送ります。</Text>
+                <View style={s.sw}>
+                  <Text style={s.lbl}>撮った写真を写真アプリにも保存</Text>
+                  <Switch value={draft.savePhotos} onValueChange={(v) => setDraft({ ...draft, savePhotos: v })} />
+                </View>
+                <View style={s.sw}>
+                  <Text style={s.lbl}>送る前に撮った写真を確認する</Text>
+                  <Switch value={draft.review} onValueChange={(v) => setDraft({ ...draft, review: v })} />
+                </View>
+                <View style={s.sw}>
+                  <Text style={s.lbl}>グリッド線と水準器を出す</Text>
+                  <Switch value={draft.grid} onValueChange={(v) => setDraft({ ...draft, grid: v })} />
+                </View>
+                <View style={s.sw}>
+                  <Text style={s.lbl}>連写中は明るさ・色を固定する</Text>
+                  <Switch value={draft.lockExposure} onValueChange={(v) => setDraft({ ...draft, lockExposure: v })} />
+                </View>
+                <View style={s.sw}>
+                  <Text style={s.lbl}>外部キーボードで撮影(スペース / Enter)</Text>
+                  <Switch value={draft.keyShutter} onValueChange={(v) => setDraft({ ...draft, keyShutter: v })} />
+                </View>
+                {draft.keyShutter && <Text style={s.hint}>画面のキーボードが出てしまうときは、オフにしてください。Bluetooth のリモコンは、音量ボタンでの撮影には対応していません。</Text>}
+                <Text style={[s.h, { fontSize: 15, marginTop: 6 }]}>安全</Text>
+                <View style={s.sw}>
+                  <Text style={s.lbl}>開くときに Face ID で確認する</Text>
+                  <Switch value={draft.faceLock} onValueChange={(v) => setDraft({ ...draft, faceLock: v })} />
+                </View>
+                <View style={s.sw}>
+                  <Text style={s.lbl}>アプリの期限の前日に通知する</Text>
+                  <Switch value={draft.expiryNotify} onValueChange={(v) => setDraft({ ...draft, expiryNotify: v })} />
+                </View>
+                <Text style={s.hint}>
+                  アプリの期限: {expiry ? `${expiry.getFullYear()}/${expiry.getMonth() + 1}/${expiry.getDate()} ${p2(expiry.getHours())}:${p2(expiry.getMinutes())}(あと${daysLeft(expiry)}日)` : '読み取れませんでした'}
+                </Text>
                 <Pressable style={s.btn} onPress={applySettings}>
                   <Text style={s.btnT}>保存して開く</Text>
+                </Pressable>
+                <Pressable
+                  style={s.btn2}
+                  onPress={() => {
+                    setShowSettings(false);
+                    openDiag();
+                  }}
+                >
+                  <Text style={s.btn2T}>診断(動作の記録・版・接続)</Text>
                 </Pressable>
                 <Pressable
                   style={s.btn2}
@@ -943,12 +1264,69 @@ export default function App() {
             </View>
           </View>
         </Modal>
+
+        {/* 診断 */}
+        <Modal visible={showDiag} transparent animationType="fade" onRequestClose={() => setShowDiag(false)}>
+          <View style={s.shade}>
+            <View style={[s.card, { maxHeight: '88%' }]}>
+              <Text style={s.h}>診断</Text>
+              <ScrollView contentContainerStyle={{ gap: 6 }}>
+                <Text style={s.diagT}>版: {appJson.expo.version}(ビルド {BUILD_AT} / {BUILD_SHA.slice(0, 7)})</Text>
+                <Text style={s.diagT}>端末: {Platform.OS} {String(Platform.Version)} / {isPad ? 'iPad' : 'iPhone'}</Text>
+                <Text style={s.diagT}>
+                  アプリの期限: {expiry ? `${expiry.toLocaleString()}(あと${daysLeft(expiry)}日)` : '読み取れませんでした'}
+                </Text>
+                <Text style={s.diagT}>サーバー: {settings.url}</Text>
+                <Text style={s.diagT}>最後につながった時刻: {lastOk ? new Date(lastOk).toLocaleTimeString() : 'まだありません'}</Text>
+                <Text style={s.diagT}>
+                  未送信 {pending}件 / 裏で保存中 {jobCount}件
+                </Text>
+                {!!diagNet && <Text style={[s.diagT, { fontWeight: '700' }]}>{diagNet}</Text>}
+                <Text style={[s.lbl, { marginTop: 8 }]}>動作の記録(新しい順)</Text>
+                {diagLog.length === 0 && <Text style={s.hint}>まだありません</Text>}
+                {diagLog.map((e, i) => (
+                  <Text key={i} style={[s.diagT, e.level === 'error' && { color: '#b00020' }]}>
+                    {new Date(e.at).toLocaleTimeString()} {e.msg}
+                  </Text>
+                ))}
+              </ScrollView>
+              <Pressable style={s.btn} onPress={testNet}>
+                <Text style={s.btnT}>接続を確認する</Text>
+              </Pressable>
+              <Pressable
+                style={s.btn2}
+                onPress={() => {
+                  clearLog();
+                  setDiagLog([]);
+                }}
+              >
+                <Text style={s.btn2T}>記録を消す</Text>
+              </Pressable>
+              <Pressable style={s.btn2} onPress={() => setShowDiag(false)}>
+                <Text style={s.btn2T}>閉じる</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Face ID の確認(開いている間は、中身を見せない) */}
+        <Modal visible={locked} animationType="none" presentationStyle="fullScreen">
+          <View style={s.lock}>
+            <Text style={s.lockT}>植物管理</Text>
+            <Pressable style={s.btn} onPress={unlock}>
+              <Text style={s.btnT}>Face ID で開く</Text>
+            </Pressable>
+          </View>
+        </Modal>
       </SafeAreaView>
     </SafeAreaProvider>
   );
 }
 
 const s = StyleSheet.create({
+  lock: { flex: 1, backgroundColor: '#eef3ee', alignItems: 'center', justifyContent: 'center', gap: 20, padding: 40 },
+  lockT: { fontSize: 24, fontWeight: '700', color: '#2e5a32' },
+  diagT: { fontSize: 12, color: '#233' },
   root: { flex: 1, backgroundColor: '#fff' },
   rowFill: { flex: 1, flexDirection: 'row' },
   web: { flex: 1 },
@@ -964,6 +1342,8 @@ const s = StyleSheet.create({
   tabT: { fontSize: 10, color: '#2e5a32', fontWeight: '600' },
   badge: { position: 'absolute', right: '22%', top: 2, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: '#d32f2f', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3 },
   badgeT: { color: '#fff', fontSize: 11, fontWeight: '700' },
+  expiry: { position: 'absolute', left: 8, right: 8, top: 8, backgroundColor: 'rgba(176,0,32,0.92)', borderRadius: 8, padding: 8, zIndex: 5 },
+  expiryT: { color: '#fff', fontSize: 12, fontWeight: '600' },
   sync: { position: 'absolute', left: 8, bottom: 8, right: 8, backgroundColor: 'rgba(20,60,30,0.9)', borderRadius: 8, padding: 8 },
   syncT: { color: '#fff', fontSize: 12 },
   toast: { position: 'absolute', left: 16, right: 16, top: 56, backgroundColor: 'rgba(0,0,0,0.8)', borderRadius: 10, padding: 10 },
