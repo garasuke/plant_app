@@ -46,7 +46,23 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build | tail -n 60
+            build 2>&1 | tee build.log | tail -n 20
+
+      - name: Show errors (only when the build failed)
+        if: failure()
+        run: |
+          echo "===== error lines ====="
+          grep -n -E "error:|error: |fatal error|Command PhaseScriptExecution failed|\*\* BUILD FAILED" build.log | head -60 || true
+          echo "===== ExpoModulesJSI part ====="
+          grep -n -B2 -A40 "Build ExpoModulesJSI xcframework" build.log | grep -v "^--$" | head -150 || true
+
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
 
       - name: Package .ipa
         run: |
