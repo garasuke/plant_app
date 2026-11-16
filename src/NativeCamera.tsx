@@ -11,7 +11,7 @@ import {
   Camera,
   CommonResolutions,
   type CameraRef,
-  useCameraDevice,
+  useCameraDevices,
   useCameraPermission,
   useObjectOutput,
   usePhotoOutput,
@@ -93,7 +93,14 @@ export default function NativeCamera({
   const lastQr = useRef({ v: '', at: 0 });
   const qrHandler = useRef<(v: string) => void>(() => {});
 
-  const device = useCameraDevice('back');
+  // 背面カメラを全部調べ、レンズが一番多い(超広角・広角・望遠をまとめた)カメラを標準にする
+  const allDevices = useCameraDevices();
+  const backs = useMemo(
+    () => allDevices.filter((d) => d.position === 'back').sort((a, b) => b.physicalDevices.length - a.physicalDevices.length),
+    [allDevices],
+  );
+  const [devId, setDevId] = useState<string | null>(null);
+  const device = backs.find((d) => d.id === devId) ?? backs[0] ?? undefined;
   const photoOutput = usePhotoOutput({ qualityPrioritization: 'quality', containerFormat: 'jpeg', quality: 0.9 });
   const videoOutput = useVideoOutput({ targetResolution: CommonResolutions.UHD_16_9, enableAudio: false });
   const objectOutput = useObjectOutput({
@@ -373,6 +380,7 @@ export default function NativeCamera({
               </View>
               <Text style={s.diag}>
                 {device ? `${device.localizedName} / 倍率 ${fmtZ(curZoom / baseZoom)}` : '-'}
+                {device ? ` [レンズ${device.physicalDevices.length} 切替${(device.zoomLensSwitchFactors ?? []).join(',') || 'なし'} ズーム${device.minZoom}〜${device.maxZoom}]` : ''}
                 {target ? `  撮影先: ${target}` : ''}
                 {qrLast ? `  QR: ${qrLast.slice(0, 40)}` : ''}
                 {geoText ? `  ${geoText}` : ''}
@@ -400,6 +408,25 @@ export default function NativeCamera({
                         <Chip key={l.label} label={l.label} on={Math.abs(curZoom - l.z) < 0.01} onPress={() => !disabled && setZoom(l.z)} />
                       ))}
                     </View>
+                    {backs.length > 1 && (
+                      <>
+                        <Text style={s.label}>カメラ(切り替わらないときはここで直接選べます)</Text>
+                        <View style={s.row}>
+                          {backs.map((d) => (
+                            <Chip
+                              key={d.id}
+                              label={`${d.localizedName.replace('Back ', '')}(${d.physicalDevices.length})`}
+                              on={device?.id === d.id}
+                              onPress={() => {
+                                if (disabled) return;
+                                setDevId(d.id);
+                                setZoom(null);
+                              }}
+                            />
+                          ))}
+                        </View>
+                      </>
+                    )}
                     <View style={s.row}>
                       <Chip label={tripod ? '三脚モード: オン' : '三脚モード: オフ'} on={tripod} onPress={() => !disabled && setTripod(!tripod)} />
                       {[0, 3, 10].map((t) => (
