@@ -1,53 +1,333 @@
 // 植物管理(iPhone / iPad クライアント)
-// 既存の植物管理システムを WebView で表示し、カメラの「写真」「ピント合成」だけネイティブ撮影に差し替える。
-import { File } from 'expo-file-system';
+// 既存の植物管理システムを WebView で表示し、次の機能をアプリ側で足す。
+//  ・カメラ(写真 / ピント合成 / QR)をネイティブ撮影に差し替え
+//  ・圏外でも撮れる「クイック撮影」(端末に貯めて、つながったら自動で送信)
+//  ・撮影場所の記録 / 予定・期限の通知 / ホーム画面アイコン長押しからの起動
+//  ・調べもの画面(iPad は分割表示)と、長押しメニュー(一時メモ・ファイル管理へ保存)
+import { Directory, File, Paths } from 'expo-file-system';
+import * as Location from 'expo-location';
+import * as QuickActions from 'expo-quick-actions';
 import { StatusBar } from 'expo-status-bar';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import {
+  ActionSheetIOS,
+  ActivityIndicator,
+  Alert,
+  AppState,
+  Modal,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Switch,
+  Text,
+  TextInput,
+  useWindowDimensions,
+  View,
+} from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
 
-import { DEFAULT_URL, loadUrl, saveUrl } from './src/config';
+import { DEFAULT_SETTINGS, DEFAULT_URL, loadSettings, saveSettings, type Settings } from './src/config';
 import { INJECT_BEFORE } from './src/inject';
-import NativeCamera, { type CamMode, type CamRequest, type Msg, type Taken } from './src/NativeCamera';
+import NativeCamera, { type CamMode, type CamRequest, type Msg, type SendMeta, type Taken } from './src/NativeCamera';
+import { cancelAllNotify, ensureNotifyPermission, scheduleFromItems, type NotifyItem } from './src/notify';
+import { itemFileUri, queueAdd, queueList, queueRemove, queueUpdate, type QItem } from './src/queue';
+import ResearchBrowser, { type CtxInfo } from './src/ResearchBrowser';
 
-const stamp = () => {
-  const d = new Date();
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+type Geo = { lat: number; lng: number; acc: number; at: number };
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const p2 = (n: number) => String(n).padStart(2, '0');
+const stampOf = (t: number) => {
+  const d = new Date(t);
+  return `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
 };
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const isPad = (Platform as unknown as { isPad?: boolean }).isPad === true;
 
 export default function App() {
-  const [url, setUrl] = useState<string | null>(null);
-  const [draft, setDraft] = useState('');
+  const { width } = useWindowDimensions();
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [draft, setDraft] = useState<Settings>(DEFAULT_SETTINGS);
   const [showSettings, setShowSettings] = useState(false);
   const [loadErr, setLoadErr] = useState('');
   const [webKey, setWebKey] = useState(0);
+  const [toastT, setToastT] = useState('');
 
   const [req, setReq] = useState<CamRequest | null>(null);
   const [camMsg, setCamMsg] = useState<Msg>({ text: '' });
   const [sending, setSending] = useState(false);
   const [savedTick, setSavedTick] = useState(0);
+  const [camTarget, setCamTarget] = useState('');
+  const [camTitle, setCamTitle] = useState('');
+  const [forceMode, setForceMode] = useState<{ mode: CamMode; tick: number } | null>(null);
+  const [geoText, setGeoText] = useState('');
+
+  const [pending, setPending] = useState(0);
+  const [syncMsg, setSyncMsg] = useState('');
+  const [showQueue, setShowQueue] = useState(false);
+  const [queueItems, setQueueItems] = useState<QItem[]>([]);
+
+  const [splitOn, setSplitOn] = useState(false);
+  const [phoneResearch, setPhoneResearch] = useState(false);
+  const [rUrl, setRUrl] = useState('https://www.google.com');
+  const [rTick, setRTick] = useState(0);
+  const lastUrl = useRef('');
 
   const webRef = useRef<WebView<object>>(null);
+  const workRef = useRef<WebView<object>>(null);
   const reqRef = useRef<CamRequest | null>(null);
   reqRef.current = req;
+  const settingsRef = useRef<Settings>(DEFAULT_SETTINGS);
+  if (settings) settingsRef.current = settings;
+
+  const pend = useRef(new Map<string, { res: (v: any) => void; rej: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>());
+  const wseq = useRef(0);
+  const workLoaded = useRef(false);
+  const syncing = useRef(false);
+  const lastNotify = useRef(0);
+  const geoRef = useRef<Geo | null>(null);
+  const geoSub = useRef<Location.LocationSubscription | null>(null);
+  const wide = width >= 700;
+
+  const toast = useCallback((t: string) => {
+    setToastT(t);
+    setTimeout(() => setToastT((c) => (c === t ? '' : c)), 4000);
+  }, []);
 
   useEffect(() => {
-    loadUrl().then((u) => {
-      setUrl(u);
-      setDraft(u);
+    loadSettings().then((s) => {
+      setSettings(s);
+      setDraft(s);
     });
   }, []);
 
   const js = useCallback((code: string) => webRef.current?.injectJavaScript(code + ';true;'), []);
 
+  // ---------- 裏方の画面(ログイン済みの権限で、送信や一覧の取得をする) ----------
+  const call = useCallback((kind: string, payload: object = {}, ms = 60000) => {
+    return new Promise<any>((res, rej) => {
+      const id = 'w' + ++wseq.current;
+      const timer = setTimeout(() => {
+        pend.current.delete(id);
+        rej(new Error('時間内に応答がありませんでした'));
+      }, ms);
+      pend.current.set(id, { res, rej, timer });
+      workRef.current?.injectJavaScript(
+        `window.__w?window.__w.run(${JSON.stringify(id)},${JSON.stringify(kind)},${JSON.stringify(payload)}):0;true;`,
+      );
+    });
+  }, []);
+
+  const putFile = useCallback(async (key: string, i: number, name: string, mime: string, uri: string) => {
+    const b64 = await new File(uri).base64();
+    workRef.current?.injectJavaScript(
+      `window.__w.put(${JSON.stringify(key)},${i},${JSON.stringify(name)},${JSON.stringify(mime)},${JSON.stringify(b64)});true;`,
+    );
+  }, []);
+
+  const onWorkMessage = useCallback((ev: WebViewMessageEvent) => {
+    try {
+      const m = JSON.parse(ev.nativeEvent.data);
+      if (m.t !== 'w') return;
+      const p = pend.current.get(m.id);
+      if (!p) return;
+      clearTimeout(p.timer);
+      pend.current.delete(m.id);
+      if (m.ok) p.res(m.data);
+      else p.rej(new Error(m.error || 'うまくいきませんでした'));
+    } catch {
+      // 無視
+    }
+  }, []);
+
+  const ensureWorker = useCallback(async (): Promise<boolean> => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (workLoaded.current) {
+          const d = await call('ping', {}, 8000);
+          if (d && d.csrf && d.cam) return true;
+        }
+      } catch {
+        // 読み込み直す
+      }
+      workLoaded.current = false;
+      workRef.current?.reload();
+      for (let i = 0; i < 12 && !workLoaded.current; i++) await sleep(1000);
+    }
+    return false;
+  }, [call]);
+
+  // ---------- 順番待ち(圏外で撮ったもの)の送信 ----------
+  const refreshPending = useCallback(async () => {
+    const l = await queueList();
+    setPending(l.length);
+    setQueueItems(l);
+    return l;
+  }, []);
+
+  const syncQueue = useCallback(
+    async (manual = false) => {
+      if (syncing.current) return;
+      syncing.current = true;
+      try {
+        const items = await refreshPending();
+        if (!items.length) {
+          if (manual) toast('送る分はありません');
+          setSyncMsg('');
+          return;
+        }
+        setSyncMsg(`未送信 ${items.length}件: 接続を確認しています…`);
+        if (!(await ensureWorker())) {
+          setSyncMsg(`未送信 ${items.length}件: サーバーに接続できないため、つながったら自動で送ります`);
+          if (manual) toast('サーバーに接続できません(VPN・ログインを確認してください)');
+          return;
+        }
+        let ok = 0;
+        let ng = 0;
+        for (let n = 0; n < items.length; n++) {
+          const it = items[n];
+          setSyncMsg(`送信中 ${n + 1} / ${items.length}…`);
+          try {
+            const extra: Record<string, string> = {};
+            if (it.qr) {
+              const d = await call('lookup', { text: it.qr });
+              if (d && d.id) {
+                extra.table = String(d.table || '');
+                extra.target_id = String(d.id);
+              }
+            }
+            if (it.name) extra.name = it.name;
+            const base = stampOf(it.at);
+            for (let i = 0; i < it.files.length; i++) {
+              const nm = it.kind === 'photo' ? `camera_${base}.jpg` : `focus_${base}_${i + 1}.jpg`;
+              await putFile(it.id, i, nm, 'image/jpeg', itemFileUri(it, i));
+            }
+            await call(it.kind === 'photo' ? 'upload' : 'stack', { key: it.id, extra, geo: it.geo }, 240000);
+            queueRemove(it.id);
+            ok++;
+          } catch (e) {
+            ng++;
+            const m = errMsg(e);
+            it.tries += 1;
+            it.error = m;
+            await queueUpdate(it);
+            if (/ログイン|時間内|ネットワーク|network|接続/i.test(m)) break;
+          }
+        }
+        const left = await refreshPending();
+        setSyncMsg(left.length ? `未送信 ${left.length}件(あとで自動で再送します)` : '');
+        if (manual || ok) toast(`送信: ${ok}件 完了${ng ? ` / ${ng}件 失敗` : ''}`);
+      } finally {
+        syncing.current = false;
+        refreshPending();
+      }
+    },
+    [call, ensureWorker, putFile, refreshPending, toast],
+  );
+
+  // ---------- 通知 ----------
+  const refreshNotify = useCallback(
+    async (manual = false) => {
+      const st = settingsRef.current;
+      if (!st.notify) {
+        await cancelAllNotify();
+        return;
+      }
+      try {
+        if (!(await ensureNotifyPermission())) {
+          if (manual) toast('通知が許可されていません(iPhoneの設定で許可してください)');
+          return;
+        }
+        if (!(await ensureWorker())) {
+          if (manual) toast('サーバーに接続できないため、通知を更新できません');
+          return;
+        }
+        const d = await call('notify', { days: st.notifyDays });
+        const raw: any[] = (d && (d.items || (d.data && d.data.items))) || [];
+        const items: NotifyItem[] = raw.map((r) => ({
+          title: `${r.kind_label ? r.kind_label + ': ' : ''}${r.title || ''}`,
+          date: String(r.date || ''),
+          level: r.level,
+        }));
+        const n = await scheduleFromItems(items, st.notifyHour, st.notifyDays);
+        lastNotify.current = Date.now();
+        if (manual) toast(`通知を${n}件 予約しました`);
+      } catch (e) {
+        if (manual) toast('通知を更新できませんでした: ' + errMsg(e));
+      }
+    },
+    [call, ensureWorker, toast],
+  );
+
+  // ---------- 撮影場所 ----------
+  const startGeo = useCallback(async () => {
+    if (!settingsRef.current.geo) {
+      setGeoText('');
+      return;
+    }
+    try {
+      const p = await Location.requestForegroundPermissionsAsync();
+      if (!p.granted) {
+        setGeoText('位置情報: 許可なし');
+        return;
+      }
+      setGeoText('位置情報: 取得中…');
+      geoSub.current?.remove();
+      geoSub.current = await Location.watchPositionAsync(
+        { accuracy: Location.Accuracy.Balanced, timeInterval: 4000, distanceInterval: 3 },
+        (l) => {
+          geoRef.current = { lat: l.coords.latitude, lng: l.coords.longitude, acc: l.coords.accuracy ?? 0, at: Date.now() };
+          setGeoText(`位置 ±${Math.round(l.coords.accuracy ?? 0)}m`);
+        },
+      );
+    } catch {
+      setGeoText('位置情報: 取得できません');
+    }
+  }, []);
+  const stopGeo = useCallback(() => {
+    geoSub.current?.remove();
+    geoSub.current = null;
+  }, []);
+  const getGeo = useCallback(async (): Promise<Geo | null> => {
+    if (!settingsRef.current.geo) return null;
+    const g = geoRef.current;
+    if (g && Date.now() - g.at < 10 * 60 * 1000) return g;
+    try {
+      const l = await Promise.race([Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }), sleep(6000).then(() => null)]);
+      if (l) {
+        geoRef.current = { lat: l.coords.latitude, lng: l.coords.longitude, acc: l.coords.accuracy ?? 0, at: Date.now() };
+        return geoRef.current;
+      }
+    } catch {
+      // 位置なしで続ける
+    }
+    return null;
+  }, []);
+
+  // ---------- カメラ ----------
+  const openQuick = useCallback(
+    (mode: CamMode) => {
+      setCamMsg({ text: '' });
+      setSending(false);
+      setCamTarget('');
+      setCamTitle('');
+      setForceMode({ mode, tick: Date.now() });
+      setReq({ id: 'quick', title: 'クイック撮影(圏外でも使えます)', modes: ['photo', 'burst', 'qr'], mode, keepOpen: true, hasWeb: false, queue: true });
+      startGeo();
+    },
+    [startGeo],
+  );
+
   const closeCam = useCallback(() => {
     const r = reqRef.current;
     setReq(null);
     setSending(false);
-    if (r) js(`window.__nc&&window.__nc.closed(${JSON.stringify(r.id)})`);
-  }, [js]);
+    stopGeo();
+    if (r && r.id !== 'quick') js(`window.__nc&&window.__nc.closed(${JSON.stringify(r.id)})`);
+    if (r && r.id === 'quick') syncQueue();
+  }, [js, stopGeo, syncQueue]);
 
   const onMessage = useCallback(
     (ev: WebViewMessageEvent) => {
@@ -57,17 +337,31 @@ export default function App() {
       } catch {
         return;
       }
+      const cur = reqRef.current;
       switch (m.t) {
         case 'open':
           setCamMsg({ text: '' });
           setSending(false);
+          setCamTarget(m.target || '');
+          setCamTitle('');
+          setForceMode(null);
           setReq({ id: m.id, title: m.title, modes: m.modes, mode: m.mode, keepOpen: !!m.keepOpen, hasWeb: !!m.hasWeb });
+          startGeo();
           break;
         case 'close':
           closeCam();
           break;
         case 'say':
-          setCamMsg({ text: String(m.msg || '') });
+          setCamMsg({ text: String(m.msg || ''), error: !!m.bad });
+          break;
+        case 'mode':
+          if (cur && m.id === cur.id) setForceMode({ mode: m.mode, tick: Date.now() });
+          break;
+        case 'title':
+          if (cur && m.id === cur.id) setCamTitle(String(m.title || ''));
+          break;
+        case 'target':
+          if (cur && m.id === cur.id) setCamTarget(String(m.name || ''));
           break;
         case 'saved':
           setSending(false);
@@ -81,17 +375,32 @@ export default function App() {
           break;
       }
     },
-    [closeCam],
+    [closeCam, startGeo],
   );
 
   const onSend = useCallback(
-    async (kind: CamMode, files: Taken[]) => {
+    async (kind: 'photo' | 'burst', files: Taken[], meta: SendMeta) => {
       const r = reqRef.current;
       if (!r) return;
       setSending(true);
-      setCamMsg({ text: 'サーバーへ送っています…' });
       try {
-        const base = stamp();
+        const g = await getGeo();
+        if (r.queue) {
+          await queueAdd(kind, files.map((f) => f.path), {
+            name: meta.name,
+            qr: meta.qr,
+            geo: g ? { lat: g.lat, lng: g.lng, acc: g.acc } : undefined,
+          });
+          const l = await refreshPending();
+          setSavedTick((t) => t + 1);
+          setSending(false);
+          setCamMsg({ text: `端末に保存しました(未送信 ${l.length}件)。つながると自動で送ります。` });
+          syncQueue();
+          return;
+        }
+        setCamMsg({ text: 'サーバーへ送っています…' });
+        js(g ? `window.__nc.geo(${JSON.stringify({ lat: g.lat, lng: g.lng, acc: g.acc })})` : 'window.__nc.geo(null)');
+        const base = stampOf(Date.now());
         for (let i = 0; i < files.length; i++) {
           const b64 = await new File('file://' + files[i].path).base64();
           const name = kind === 'photo' ? `camera_${base}.jpg` : `focus_${base}_${i + 1}.jpg`;
@@ -101,74 +410,285 @@ export default function App() {
         }
       } catch (e) {
         setSending(false);
-        setCamMsg({ text: '送信の準備に失敗: ' + (e instanceof Error ? e.message : String(e)), error: true });
+        setCamMsg({ text: '送信の準備に失敗: ' + errMsg(e), error: true });
       }
     },
-    [js],
+    [getGeo, js, refreshPending, syncQueue],
   );
 
-  const onUseWeb = useCallback(
-    (mode: 'video' | 'qr') => {
+  const onQR = useCallback(
+    (text: string) => {
       const r = reqRef.current;
-      setReq(null);
-      setSending(false);
-      if (r) js(`window.__nc&&window.__nc.useweb(${JSON.stringify(r.id)},${JSON.stringify(mode)})`);
+      if (r && r.id !== 'quick') js(`window.__nc&&window.__nc.qr(${JSON.stringify(r.id)},${JSON.stringify(text)})`);
     },
     [js],
   );
 
-  const applyUrl = () => {
-    const u = draft.trim();
-    if (!/^https?:\/\//.test(u)) return;
-    saveUrl(u);
-    setUrl(u);
+  const onUseWeb = useCallback(() => {
+    const r = reqRef.current;
+    setReq(null);
+    setSending(false);
+    stopGeo();
+    if (r) js(`window.__nc&&window.__nc.useweb(${JSON.stringify(r.id)},"video")`);
+  }, [js, stopGeo]);
+
+  // ---------- 調べもの画面の長押しメニュー ----------
+  const memoAdd = useCallback(
+    async (body: string, title: string, url: string) => {
+      try {
+        if (!(await ensureWorker())) throw new Error('サーバーに接続できません(ログインを確認してください)');
+        await call('memo', { data: { body: body.slice(0, 4000), source_title: title.slice(0, 255), source_url: /^https?:\/\//i.test(url) && url.length <= 2000 ? url : '' } });
+        toast('一時メモに追加しました: ' + body.replace(/\s+/g, ' ').slice(0, 40));
+      } catch (e) {
+        toast('一時メモに追加できませんでした: ' + errMsg(e));
+      }
+    },
+    [call, ensureWorker, toast],
+  );
+
+  const saveImage = useCallback(
+    async (src: string) => {
+      if (!/^https?:\/\//i.test(src)) {
+        toast('この画像は保存できません(通常のアドレスの画像のみ)');
+        return;
+      }
+      try {
+        if (!(await ensureWorker())) throw new Error('サーバーに接続できません(ログインを確認してください)');
+        const m = /\.(jpe?g|png|webp|gif)(\?|#|$)/i.exec(src);
+        const ext = m ? m[1].toLowerCase().replace('jpeg', 'jpg') : 'jpg';
+        const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+        const dir = new Directory(Paths.cache, 'dl');
+        dir.create({ intermediates: true, idempotent: true });
+        const dest = new File(dir, `dl_${Date.now()}.${ext}`);
+        const f = await File.downloadFileAsync(src, dest);
+        const key = 'img' + Date.now();
+        await putFile(key, 0, `web_${stampOf(Date.now())}.${ext}`, mime, f.uri);
+        await call('upload', { key, extra: {} }, 120000);
+        try {
+          f.delete();
+        } catch {
+          // 無視
+        }
+        toast('ファイル管理に保存しました');
+      } catch (e) {
+        toast('画像を保存できませんでした: ' + errMsg(e));
+      }
+    },
+    [call, ensureWorker, putFile, toast],
+  );
+
+  const onCtx = useCallback(
+    (c: CtxInfo) => {
+      const opts: { label: string; fn: () => void }[] = [];
+      if (c.text) {
+        opts.push({ label: '選んだ文字を一時メモに追加', fn: () => memoAdd(c.text, c.title, c.url) });
+        opts.push({
+          label: '選んだ文字で検索',
+          fn: () => {
+            setRUrl('https://www.google.com/search?q=' + encodeURIComponent(c.text.slice(0, 200)));
+            setRTick((t) => t + 1);
+          },
+        });
+      }
+      if (c.src) opts.push({ label: '画像をファイル管理に保存', fn: () => saveImage(c.src) });
+      if (c.href) {
+        opts.push({ label: 'リンクを一時メモに追加', fn: () => memoAdd(c.href, c.title, c.href) });
+        opts.push({
+          label: 'リンク先を開く',
+          fn: () => {
+            setRUrl(c.href);
+            setRTick((t) => t + 1);
+          },
+        });
+      }
+      opts.push({ label: 'このページを一時メモに追加', fn: () => memoAdd(c.title || c.url, c.title, c.url) });
+      ActionSheetIOS.showActionSheetWithOptions(
+        { options: [...opts.map((o) => o.label), 'キャンセル'], cancelButtonIndex: opts.length, title: c.text ? c.text.slice(0, 60) : c.href || c.src || c.title },
+        (i) => {
+          if (i < opts.length) opts[i].fn();
+        },
+      );
+    },
+    [memoAdd, saveImage],
+  );
+
+  // ---------- 起動・復帰 ----------
+  useEffect(() => {
+    // ホーム画面アイコンの長押しメニュー
+    QuickActions.setItems([
+      { id: 'quick', title: 'クイック撮影', subtitle: '圏外でも撮れます', icon: 'symbol:camera' },
+      { id: 'qr', title: 'QRを読んで撮る', icon: 'symbol:qrcode' },
+    ]).catch(() => {});
+    const handle = (id?: string) => {
+      if (id === 'quick') openQuick('photo');
+      else if (id === 'qr') openQuick('qr');
+    };
+    handle(QuickActions.initial?.id);
+    const sub = QuickActions.addListener((a) => handle(a.id));
+    return () => sub.remove();
+  }, [openQuick]);
+
+  useEffect(() => {
+    refreshPending();
+    const sub = AppState.addEventListener('change', (st) => {
+      if (st !== 'active') return;
+      if (loadErr) webRef.current?.reload();
+      syncQueue();
+      if (Date.now() - lastNotify.current > 30 * 60 * 1000) refreshNotify();
+    });
+    const iv = setInterval(() => {
+      if (AppState.currentState === 'active') {
+        if (loadErr) webRef.current?.reload();
+        syncQueue();
+      }
+    }, 90000);
+    return () => {
+      sub.remove();
+      clearInterval(iv);
+    };
+  }, [loadErr, refreshNotify, refreshPending, syncQueue]);
+
+  const onWorkLoadEnd = useCallback(() => {
+    workLoaded.current = true;
+    syncQueue();
+    if (Date.now() - lastNotify.current > 30 * 60 * 1000) refreshNotify();
+  }, [refreshNotify, syncQueue]);
+
+  const applySettings = () => {
+    const u = draft.url.trim();
+    if (!/^https?:\/\//.test(u)) {
+      Alert.alert('アドレスは http:// か https:// から入力してください');
+      return;
+    }
+    const next = { ...draft, url: u };
+    saveSettings(next);
+    setSettings(next);
+    settingsRef.current = next;
     setLoadErr('');
     setWebKey((k) => k + 1);
     setShowSettings(false);
+    workLoaded.current = false;
+    if (!next.notify) cancelAllNotify();
+    else refreshNotify(true);
   };
 
-  if (!url) {
+  if (!settings) {
     return (
       <View style={s.center}>
         <ActivityIndicator />
       </View>
     );
   }
+  const url = settings.url;
+  const split = isPad && wide && splitOn;
+
+  const mainWeb = (
+    <WebView<object>
+      key={webKey}
+      ref={webRef}
+      source={{ uri: url }}
+      style={s.web}
+      originWhitelist={['*']}
+      javaScriptEnabled
+      domStorageEnabled
+      sharedCookiesEnabled
+      allowsInlineMediaPlayback
+      pullToRefreshEnabled
+      mediaCapturePermissionGrantType="grantIfSameHostElsePrompt"
+      allowsBackForwardNavigationGestures
+      injectedJavaScriptBeforeContentLoaded={INJECT_BEFORE}
+      onMessage={onMessage}
+      onLoadStart={() => setLoadErr('')}
+      onError={(e) => setLoadErr(e.nativeEvent.description || '読み込めませんでした')}
+      onHttpError={(e) => setLoadErr(`サーバーの応答エラー (${e.nativeEvent.statusCode})`)}
+      onContentProcessDidTerminate={() => webRef.current?.reload()}
+    />
+  );
 
   return (
     <SafeAreaProvider>
       <SafeAreaView style={s.root} edges={['top', 'left', 'right']}>
         <StatusBar style="dark" />
-        <WebView<object>
-          key={webKey}
-          ref={webRef}
-          source={{ uri: url }}
-          style={s.web}
-          originWhitelist={['*']}
-          javaScriptEnabled
-          domStorageEnabled
-          sharedCookiesEnabled
-          allowsInlineMediaPlayback
-          mediaCapturePermissionGrantType="grantIfSameHostElsePrompt"
-          allowsBackForwardNavigationGestures
-          injectedJavaScriptBeforeContentLoaded={INJECT_BEFORE}
-          onMessage={onMessage}
-          onLoadStart={() => setLoadErr('')}
-          onError={(e) => setLoadErr(e.nativeEvent.description || '読み込めませんでした')}
-          onHttpError={(e) => setLoadErr(`サーバーの応答エラー (${e.nativeEvent.statusCode})`)}
-        />
-        {!!loadErr && (
-          <View style={s.err}>
-            <Text style={s.errT}>読み込めません: {loadErr}</Text>
-            <Text style={s.errH}>
-              ・同じ Wi-Fi(自宅内)に接続していますか{'\n'}
-              ・iPhone の Safari で同じアドレスが開けますか(証明書の信頼設定)
-            </Text>
+        <View style={s.rowFill}>
+          <View style={{ flex: 1 }}>
+            {mainWeb}
+            {!!loadErr && (
+              <View style={s.err}>
+                <Text style={s.errT}>読み込めません: {loadErr}</Text>
+                <Text style={s.errH}>
+                  ・VPN / 自宅の Wi-Fi につながっていますか{'\n'}
+                  ・つながると自動で読み込み直します{'\n'}
+                  ・圏外のときも、下の📷で撮影だけはできます(あとで自動送信)
+                </Text>
+                <Pressable style={s.btn2} onPress={() => webRef.current?.reload()}>
+                  <Text style={s.btn2T}>今すぐ読み込み直す</Text>
+                </Pressable>
+              </View>
+            )}
+          </View>
+          {split && (
+            <View style={s.side}>
+              <ResearchBrowser url={rUrl} navTick={rTick} onCtx={onCtx} onUrl={(u) => (lastUrl.current = u)} />
+            </View>
+          )}
+        </View>
+
+        {/* ボタン(左下) */}
+        <View style={s.fabs}>
+          <Pressable style={s.fab} onPress={() => openQuick('photo')}>
+            <Text style={s.fabT}>📷</Text>
+            {pending > 0 && (
+              <View style={s.badge}>
+                <Text style={s.badgeT}>{pending}</Text>
+              </View>
+            )}
+          </Pressable>
+          <Pressable
+            style={s.fab}
+            onPress={() => {
+              if (isPad && wide) setSplitOn(!splitOn);
+              else setPhoneResearch(true);
+            }}
+          >
+            <Text style={s.fabT}>{split ? '✕' : '🔎'}</Text>
+          </Pressable>
+          <Pressable
+            style={s.fab}
+            onPress={() => {
+              setDraft(settings);
+              refreshPending();
+              setShowSettings(true);
+            }}
+          >
+            <Text style={s.fabT}>⚙</Text>
+          </Pressable>
+        </View>
+        {!!syncMsg && (
+          <Pressable style={s.sync} onPress={() => { refreshPending(); setShowQueue(true); }}>
+            <Text style={s.syncT}>{syncMsg}</Text>
+          </Pressable>
+        )}
+        {!!toastT && (
+          <View style={s.toast} pointerEvents="none">
+            <Text style={s.toastT}>{toastT}</Text>
           </View>
         )}
-        <Pressable style={s.gear} onPress={() => setShowSettings(true)}>
-          <Text style={s.gearT}>⚙</Text>
-        </Pressable>
+
+        {/* 裏方の画面(見えない)。送信・通知の取得・一時メモへの追加に使う */}
+        <View style={s.hidden} pointerEvents="none">
+          <WebView<object>
+            ref={workRef}
+            source={{ uri: url.replace(/\/+$/, '') + '/cam.php' }}
+            originWhitelist={['*']}
+            javaScriptEnabled
+            domStorageEnabled
+            sharedCookiesEnabled
+            injectedJavaScriptBeforeContentLoaded={INJECT_BEFORE}
+            onMessage={onWorkMessage}
+            onLoadEnd={onWorkLoadEnd}
+            onContentProcessDidTerminate={() => workRef.current?.reload()}
+          />
+        </View>
 
         {req && (
           <NativeCamera
@@ -176,42 +696,138 @@ export default function App() {
             message={camMsg}
             sending={sending}
             savedTick={savedTick}
+            target={camTarget}
+            forceMode={forceMode}
+            titleText={camTitle}
+            geoText={geoText}
             onSend={onSend}
+            onQR={onQR}
             onClose={closeCam}
             onUseWeb={onUseWeb}
           />
         )}
 
-        <Modal visible={showSettings} transparent animationType="fade" onRequestClose={() => setShowSettings(false)}>
+        {/* iPhone: 調べもの画面(全画面) */}
+        <Modal visible={phoneResearch} animationType="slide" presentationStyle="fullScreen" onRequestClose={() => setPhoneResearch(false)}>
+          <SafeAreaProvider>
+            <SafeAreaView style={{ flex: 1 }}>
+              <ResearchBrowser url={rUrl} navTick={rTick} onCtx={onCtx} onClose={() => setPhoneResearch(false)} />
+            </SafeAreaView>
+          </SafeAreaProvider>
+        </Modal>
+
+        {/* 未送信の一覧 */}
+        <Modal visible={showQueue} transparent animationType="fade" onRequestClose={() => setShowQueue(false)}>
           <View style={s.shade}>
-            <View style={s.card}>
-              <Text style={s.h}>設定</Text>
-              <Text style={s.lbl}>システムのアドレス</Text>
-              <TextInput
-                value={draft}
-                onChangeText={setDraft}
-                autoCapitalize="none"
-                autoCorrect={false}
-                keyboardType="url"
-                style={s.input}
-                placeholder={DEFAULT_URL}
-              />
-              <Pressable style={s.btn} onPress={applyUrl}>
-                <Text style={s.btnT}>保存して開く</Text>
+            <View style={[s.card, { maxHeight: '80%' }]}>
+              <Text style={s.h}>未送信の撮影 {queueItems.length}件</Text>
+              <ScrollView>
+                {queueItems.length === 0 && <Text>ありません</Text>}
+                {queueItems.map((it) => (
+                  <View key={it.id} style={s.qrow}>
+                    <Text style={{ flex: 1, fontSize: 12 }}>
+                      {stampOf(it.at)} {it.kind === 'photo' ? '写真' : `ピント合成 ${it.files.length}枚`}
+                      {it.name ? ` 「${it.name}」` : ''}
+                      {it.qr ? ' QR付き' : ''}
+                      {it.error ? `\n⚠ ${it.error}` : ''}
+                    </Text>
+                    <Pressable
+                      onPress={() =>
+                        Alert.alert('削除しますか', 'この撮影は送信されずに消えます。', [
+                          { text: 'やめる', style: 'cancel' },
+                          { text: '削除', style: 'destructive', onPress: () => { queueRemove(it.id); refreshPending(); } },
+                        ])
+                      }
+                    >
+                      <Text style={{ color: '#b00020' }}>削除</Text>
+                    </Pressable>
+                  </View>
+                ))}
+              </ScrollView>
+              <Pressable style={s.btn} onPress={() => syncQueue(true)}>
+                <Text style={s.btnT}>今すぐ送る</Text>
               </Pressable>
-              <Pressable
-                style={s.btn2}
-                onPress={() => {
-                  setLoadErr('');
-                  setWebKey((k) => k + 1);
-                  setShowSettings(false);
-                }}
-              >
-                <Text style={s.btn2T}>再読み込み</Text>
-              </Pressable>
-              <Pressable style={s.btn2} onPress={() => setShowSettings(false)}>
+              <Pressable style={s.btn2} onPress={() => setShowQueue(false)}>
                 <Text style={s.btn2T}>閉じる</Text>
               </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* 設定 */}
+        <Modal visible={showSettings} transparent animationType="fade" onRequestClose={() => setShowSettings(false)}>
+          <View style={s.shade}>
+            <View style={[s.card, { maxHeight: '90%' }]}>
+              <ScrollView contentContainerStyle={{ gap: 10 }}>
+                <Text style={s.h}>設定</Text>
+                <Text style={s.lbl}>システムのアドレス</Text>
+                <TextInput
+                  value={draft.url}
+                  onChangeText={(v) => setDraft({ ...draft, url: v })}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  keyboardType="url"
+                  style={s.input}
+                  placeholder={DEFAULT_URL}
+                />
+                <View style={s.sw}>
+                  <Text style={s.lbl}>撮影場所を記録する</Text>
+                  <Switch value={draft.geo} onValueChange={(v) => setDraft({ ...draft, geo: v })} />
+                </View>
+                <View style={s.sw}>
+                  <Text style={s.lbl}>予定・期限を通知する</Text>
+                  <Switch value={draft.notify} onValueChange={(v) => setDraft({ ...draft, notify: v })} />
+                </View>
+                {draft.notify && (
+                  <>
+                    <Text style={s.lbl}>通知する時刻</Text>
+                    <View style={s.chips}>
+                      {[6, 7, 8, 9, 12, 18, 20].map((h) => (
+                        <Pressable key={h} style={[s.chip, draft.notifyHour === h && s.chipOn]} onPress={() => setDraft({ ...draft, notifyHour: h })}>
+                          <Text style={[s.chipT, draft.notifyHour === h && { color: '#fff' }]}>{h}時</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                    <Text style={s.lbl}>何日先まで</Text>
+                    <View style={s.chips}>
+                      {[3, 7, 14, 30].map((d) => (
+                        <Pressable key={d} style={[s.chip, draft.notifyDays === d && s.chipOn]} onPress={() => setDraft({ ...draft, notifyDays: d })}>
+                          <Text style={[s.chipT, draft.notifyDays === d && { color: '#fff' }]}>{d}日</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                    <Text style={s.hint}>通知は、アプリを開いたときに予約し直します。圏外のあいだは前回の予約が鳴ります。</Text>
+                  </>
+                )}
+                <Pressable style={s.btn} onPress={applySettings}>
+                  <Text style={s.btnT}>保存して開く</Text>
+                </Pressable>
+                <Pressable
+                  style={s.btn2}
+                  onPress={() => {
+                    setShowSettings(false);
+                    setShowQueue(true);
+                  }}
+                >
+                  <Text style={s.btn2T}>未送信の撮影({pending}件)を見る</Text>
+                </Pressable>
+                <Pressable style={s.btn2} onPress={() => refreshNotify(true)}>
+                  <Text style={s.btn2T}>通知を今すぐ更新</Text>
+                </Pressable>
+                <Pressable
+                  style={s.btn2}
+                  onPress={() => {
+                    setLoadErr('');
+                    setWebKey((k) => k + 1);
+                    setShowSettings(false);
+                  }}
+                >
+                  <Text style={s.btn2T}>再読み込み</Text>
+                </Pressable>
+                <Pressable style={s.btn2} onPress={() => setShowSettings(false)}>
+                  <Text style={s.btn2T}>閉じる</Text>
+                </Pressable>
+              </ScrollView>
             </View>
           </View>
         </Modal>
@@ -222,17 +838,34 @@ export default function App() {
 
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#fff' },
+  rowFill: { flex: 1, flexDirection: 'row' },
   web: { flex: 1 },
+  side: { flex: 1, borderLeftWidth: 1, borderLeftColor: '#9ab' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  err: { position: 'absolute', left: 12, right: 12, top: 60, backgroundColor: '#fff3f3', borderColor: '#b00020', borderWidth: 1, borderRadius: 8, padding: 10 },
+  hidden: { position: 'absolute', width: 2, height: 2, opacity: 0, left: 0, top: 0, overflow: 'hidden' },
+  err: { position: 'absolute', left: 12, right: 12, top: 60, backgroundColor: '#fff3f3', borderColor: '#b00020', borderWidth: 1, borderRadius: 8, padding: 10, gap: 6 },
   errT: { color: '#b00020', fontWeight: '700' },
-  errH: { color: '#533', marginTop: 4, fontSize: 12 },
-  gear: { position: 'absolute', right: 8, bottom: 8, width: 36, height: 36, borderRadius: 18, backgroundColor: 'rgba(0,0,0,0.45)', alignItems: 'center', justifyContent: 'center' },
-  gearT: { color: '#fff', fontSize: 18 },
+  errH: { color: '#533', fontSize: 12 },
+  fabs: { position: 'absolute', left: 8, bottom: 8, flexDirection: 'row', gap: 8 },
+  fab: { width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(0,0,0,0.5)', alignItems: 'center', justifyContent: 'center' },
+  fabT: { color: '#fff', fontSize: 18 },
+  badge: { position: 'absolute', right: -4, top: -4, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: '#d32f2f', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3 },
+  badgeT: { color: '#fff', fontSize: 11, fontWeight: '700' },
+  sync: { position: 'absolute', left: 8, bottom: 56, right: 8, backgroundColor: 'rgba(20,60,30,0.9)', borderRadius: 8, padding: 8 },
+  syncT: { color: '#fff', fontSize: 12 },
+  toast: { position: 'absolute', left: 16, right: 16, top: 56, backgroundColor: 'rgba(0,0,0,0.8)', borderRadius: 10, padding: 10 },
+  toastT: { color: '#fff', fontSize: 13 },
   shade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'center', padding: 24 },
   card: { backgroundColor: '#fff', borderRadius: 12, padding: 16, gap: 10 },
   h: { fontSize: 18, fontWeight: '700' },
   lbl: { fontWeight: '600', color: '#344' },
+  hint: { color: '#566', fontSize: 12 },
+  sw: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  chip: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: 16, borderWidth: 1, borderColor: '#2e7d32', backgroundColor: '#fff' },
+  chipOn: { backgroundColor: '#2e7d32' },
+  chipT: { color: '#2e7d32', fontWeight: '600' },
+  qrow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#dde' },
   input: { borderWidth: 1, borderColor: '#9ab', borderRadius: 8, padding: 10, fontSize: 15 },
   btn: { backgroundColor: '#2e7d32', padding: 12, borderRadius: 10, alignItems: 'center' },
   btnT: { color: '#fff', fontWeight: '700' },

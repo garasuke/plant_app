@@ -2,8 +2,8 @@
   "expo": {
     "name": "植物管理",
     "slug": "plantclient",
-    "version": "1.0.0",
-    "orientation": "portrait",
+    "version": "3.0.0",
+    "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
@@ -16,8 +16,12 @@
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
         },
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSLocationWhenInUseUsageDescription": "撮影した写真に、撮影場所(位置情報)を記録するために使います"
       }
-    }
+    },
+    "plugins": [
+      "expo-quick-actions"
+    ]
   }
 }
