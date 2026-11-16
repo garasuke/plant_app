@@ -1,35 +1,47 @@
-// ネイティブ撮影画面(写真 / ピント合成用の連写)。
-// 結果は親(App)を通して WebView 内のページへ渡され、ページ側が従来どおり保存する。
+// ネイティブ撮影画面: 写真 / ピント合成(写真または動画から)/ QR読み取り。
+// ・レンズは倍率(0.5x・1x・2x・望遠)で切り替える
+// ・ピント範囲は「近い所」「遠い所」をタップして自動で決められる
+// ・三脚モード(セルフタイマー+ピント移動後の待ち時間を長く)
+// ・順番待ち(圏外用)として使うときは、結果を端末内へ貯める(親が処理)
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Image, Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Image, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { getThumbnailAsync } from 'expo-video-thumbnails';
 import {
   Camera,
+  CommonResolutions,
   type CameraRef,
   useCameraDevice,
   useCameraPermission,
+  useObjectOutput,
   usePhotoOutput,
+  useVideoOutput,
 } from 'react-native-vision-camera';
 
-export type CamMode = 'photo' | 'burst';
-export type CamRequest = { id: string; title: string; modes: CamMode[]; mode: CamMode; keepOpen: boolean; hasWeb: boolean };
+export type CamMode = 'photo' | 'burst' | 'qr';
+export type CamRequest = {
+  id: string;
+  title: string;
+  modes: CamMode[];
+  mode: CamMode;
+  keepOpen: boolean;
+  hasWeb: boolean;
+  queue?: boolean; // 圏外用(端末内に貯める)
+};
 export type Taken = { path: string };
 export type Msg = { text: string; error?: boolean };
+export type SendMeta = { name?: string; qr?: string };
 
-type LensKey = 'wide' | 'ultra' | 'tele';
-const LENSES: { key: LensKey; label: string; type: 'wide-angle' | 'ultra-wide-angle' | 'telephoto' }[] = [
-  { key: 'wide', label: '標準', type: 'wide-angle' },
-  { key: 'ultra', label: '超広角', type: 'ultra-wide-angle' },
-  { key: 'tele', label: '望遠', type: 'telephoto' },
-];
-type Frame = { path: string; target: number; actual: number };
+type Frame = { path: string; label: string };
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-const RANGES: [number, number][] = [[0.2, 0.8], [0.0, 1.0], [0.0, 0.5], [0.5, 1.0]];
+const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+const r2 = (v: number) => Math.round(v * 100) / 100;
+const fmtZ = (x: number) => `${Math.round(x * 10) / 10}x`;
 
 function positions(n: number, from: number, to: number): number[] {
-  if (n <= 1) return [from];
-  return Array.from({ length: n }, (_, i) => Math.round((from + ((to - from) * i) / (n - 1)) * 100) / 100);
+  if (n <= 1) return [r2(from)];
+  return Array.from({ length: n }, (_, i) => r2(from + ((to - from) * i) / (n - 1)));
 }
 
 type Props = {
@@ -37,48 +49,143 @@ type Props = {
   message: Msg;
   sending: boolean;
   savedTick: number;
-  onSend: (kind: CamMode, files: Taken[]) => void;
+  target: string;
+  forceMode: { mode: CamMode; tick: number } | null;
+  titleText: string;
+  geoText: string;
+  onSend: (kind: 'photo' | 'burst', files: Taken[], meta: SendMeta) => void;
+  onQR: (text: string) => void;
   onClose: () => void;
-  onUseWeb: (mode: 'video' | 'qr') => void;
+  onUseWeb: () => void;
 };
 
-export default function NativeCamera({ req, message, sending, savedTick, onSend, onClose, onUseWeb }: Props) {
+export default function NativeCamera({
+  req,
+  message,
+  sending,
+  savedTick,
+  target,
+  forceMode,
+  titleText,
+  geoText,
+  onSend,
+  onQR,
+  onClose,
+  onUseWeb,
+}: Props) {
   const { hasPermission, requestPermission } = useCameraPermission();
   const [mode, setMode] = useState<CamMode>(req.mode);
-  const [lens, setLens] = useState<LensKey>('wide');
+  const [method, setMethod] = useState<'photo' | 'video'>('photo');
   const [steps, setSteps] = useState(5);
+  const [vframes, setVframes] = useState(12);
   const [range, setRange] = useState<[number, number]>([0.2, 0.8]);
+  const [zoom, setZoom] = useState<number | null>(null);
+  const [tripod, setTripod] = useState(false);
+  const [timer, setTimer] = useState(0);
+  const [pick, setPick] = useState(false);
+  const [picks, setPicks] = useState<number[]>([]);
   const [busy, setBusy] = useState(false);
   const [local, setLocal] = useState('');
   const [frames, setFrames] = useState<Frame[]>([]);
+  const [qrLast, setQrLast] = useState('');
+  const [name, setName] = useState('');
   const camRef = useRef<CameraRef>(null);
+  const lastQr = useRef({ v: '', at: 0 });
+  const qrHandler = useRef<(v: string) => void>(() => {});
 
-  const lensType = LENSES.find((l) => l.key === lens)!.type;
-  const device = useCameraDevice('back', { physicalDevices: [lensType] });
+  const device = useCameraDevice('back');
   const photoOutput = usePhotoOutput({ qualityPrioritization: 'quality', containerFormat: 'jpeg', quality: 0.9 });
+  const videoOutput = useVideoOutput({ targetResolution: CommonResolutions.UHD_16_9, enableAudio: false });
+  const objectOutput = useObjectOutput({
+    types: ['qr'],
+    onObjectsScanned: (objs) => {
+      for (const o of objs) {
+        const v = (o as unknown as { value?: string }).value;
+        if (v) {
+          qrHandler.current(v);
+          break;
+        }
+      }
+    },
+  });
+
+  // 倍率ボタン(0.5x / 1x / 2x / 望遠)
+  const lenses = useMemo(() => {
+    if (!device) return [] as { label: string; z: number }[];
+    const sw = device.zoomLensSwitchFactors ?? [];
+    const base = sw.length ? sw[0] : device.minZoom;
+    const out: { label: string; z: number }[] = [];
+    if (sw.length && device.minZoom < base - 0.01) out.push({ label: fmtZ(device.minZoom / base), z: device.minZoom });
+    out.push({ label: '1x', z: base });
+    if (base * 2 <= device.maxZoom) out.push({ label: '2x', z: base * 2 });
+    for (let i = 1; i < sw.length; i++) if (sw[i] > base * 2.01 && sw[i] <= device.maxZoom) out.push({ label: fmtZ(sw[i] / base), z: sw[i] });
+    return out;
+  }, [device]);
+  const baseZoom = lenses.find((l) => l.label === '1x')?.z ?? device?.minZoom ?? 1;
+  const curZoom = zoom ?? baseZoom;
+
   const pos = useMemo(() => positions(steps, range[0], range[1]), [steps, range]);
 
-  // 保存できたら連写の一覧を空にする
   useEffect(() => {
-    if (savedTick > 0) setFrames([]);
+    if (savedTick > 0) {
+      setFrames([]);
+      if (req.queue) {
+        setQrLast('');
+        setName('');
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [savedTick]);
+  useEffect(() => {
+    if (forceMode && req.modes.includes(forceMode.mode)) setMode(forceMode.mode);
+  }, [forceMode, req.modes]);
 
-  const physTypes = device ? device.physicalDevices.map((d) => d.type) : [];
-  const lensMatches = !!device && physTypes.includes(lensType);
+  const disabled = busy || sending;
+  const outputs = useMemo(
+    () => (mode === 'qr' ? [objectOutput] : mode === 'burst' && method === 'video' ? [videoOutput] : [photoOutput]),
+    [mode, method, objectOutput, videoOutput, photoOutput],
+  );
+
+  // QR: 同じ文字は2.5秒間は無視。順番待ち用は自分で持ち、通常は親(ページ)へ渡す
+  qrHandler.current = (v: string) => {
+    const now = Date.now();
+    if (lastQr.current.v === v && now - lastQr.current.at < 2500) return;
+    lastQr.current = { v, at: now };
+    setQrLast(v);
+    if (req.queue) {
+      setMode('photo');
+      setLocal('QRを読み取りました。撮影すると、このQRの記録に紐づけて送ります。');
+    } else {
+      onQR(v);
+    }
+  };
+
+  const countdown = useCallback(async () => {
+    const sec = timer;
+    for (let i = sec; i > 0; i--) {
+      setLocal(`${i}秒後に撮影します…`);
+      await sleep(1000);
+    }
+  }, [timer]);
+
+  const settle = tripod ? 900 : 450;
+  const meta: SendMeta = { name: name.trim() || undefined, qr: qrLast || undefined };
 
   const shootPhoto = useCallback(async () => {
     if (!device) return;
     setBusy(true);
     setLocal('');
     try {
+      await countdown();
       const pf = await photoOutput.capturePhotoToFile({}, {});
-      onSend('photo', [{ path: pf.filePath }]);
+      onSend('photo', [{ path: pf.filePath }], meta);
     } catch (e) {
       setLocal('撮影に失敗: ' + (e instanceof Error ? e.message : String(e)));
     } finally {
       setBusy(false);
     }
-  }, [device, photoOutput, onSend]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [device, photoOutput, onSend, countdown, name, qrLast]);
 
   const shootBurst = useCallback(async () => {
     const c = camRef.current?.controller;
@@ -87,20 +194,20 @@ export default function NativeCamera({ req, message, sending, savedTick, onSend,
       return;
     }
     if (!device.supportsFocusLocking) {
-      setLocal('このレンズはレンズ位置の固定に対応していません。別のレンズを選んでください。');
+      setLocal('このカメラはレンズ位置の固定に対応していません。');
       return;
     }
     setBusy(true);
     setFrames([]);
     try {
+      await countdown();
       const out: Frame[] = [];
       for (let i = 0; i < pos.length; i++) {
         setLocal(`ピントを動かして撮影中 ${i + 1} / ${pos.length}`);
         await c.setFocusLocked(pos[i]);
-        await sleep(450);
-        const actual = c.lensPosition;
+        await sleep(settle);
         const pf = await photoOutput.capturePhotoToFile({}, {});
-        out.push({ path: pf.filePath, target: pos[i], actual });
+        out.push({ path: pf.filePath, label: `${i + 1}: ${pos[i]}` });
       }
       setFrames(out);
       setLocal(`${out.length}枚撮れました。よければ「ピント合成して保存」を押してください。`);
@@ -114,16 +221,120 @@ export default function NativeCamera({ req, message, sending, savedTick, onSend,
       }
       setBusy(false);
     }
-  }, [device, photoOutput, pos]);
+  }, [device, photoOutput, pos, countdown, settle]);
 
-  const disabled = busy || sending;
+  // 動画で撮りながらピントを動かし、あとでコマを取り出す(実験)
+  const shootVideo = useCallback(async () => {
+    const c = camRef.current?.controller;
+    if (!c || !device) {
+      setLocal('カメラの準備中です。');
+      return;
+    }
+    if (!device.supportsFocusLocking) {
+      setLocal('このカメラはレンズ位置の固定に対応していません。');
+      return;
+    }
+    setBusy(true);
+    setFrames([]);
+    try {
+      await countdown();
+      const rec = await videoOutput.createRecorder({});
+      let resolveFile!: (p: string) => void;
+      let rejectFile!: (e: Error) => void;
+      const fileP = new Promise<string>((res, rej) => {
+        resolveFile = res;
+        rejectFile = rej;
+      });
+      await rec.startRecording(
+        (fp) => resolveFile(fp),
+        (e) => rejectFile(e),
+      );
+      const t0 = Date.now();
+      setLocal('動画を撮りながらピントを動かしています…');
+      const n = 24;
+      const sweep = positions(n, range[0], range[1]);
+      for (let i = 0; i < n; i++) {
+        await c.setFocusLocked(sweep[i]);
+        await sleep(tripod ? 90 : 60);
+      }
+      const dur = Date.now() - t0;
+      await rec.stopRecording();
+      const file = await fileP;
+      const uri = file.startsWith('file://') ? file : 'file://' + file;
+      const out: Frame[] = [];
+      const from = 250;
+      const to = Math.max(from + 100, dur - 100);
+      for (let i = 0; i < vframes; i++) {
+        setLocal(`動画からコマを取り出しています ${i + 1} / ${vframes}`);
+        const t = Math.round(from + ((to - from) * i) / Math.max(1, vframes - 1));
+        const th = await getThumbnailAsync(uri, { time: t, quality: 0.95 });
+        out.push({ path: th.uri.replace(/^file:\/\//, ''), label: `${i + 1}: ${t}ms` });
+      }
+      setFrames(out);
+      setLocal(`${out.length}コマ取り出せました(動画 ${(dur / 1000).toFixed(1)}秒)。よければ「ピント合成して保存」を押してください。`);
+    } catch (e) {
+      setLocal('動画での連続撮影に失敗: ' + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      try {
+        await c.resetFocus();
+      } catch {
+        // 無視
+      }
+      setBusy(false);
+    }
+  }, [device, videoOutput, range, vframes, countdown, tripod]);
+
+  // ピント範囲をタップで決める(近い所 → 遠い所)
+  const onPreviewTap = useCallback(
+    async (x: number, y: number) => {
+      const cam = camRef.current;
+      const c = cam?.controller;
+      if (!cam || !c || disabled) return;
+      try {
+        await cam.focusTo({ x, y });
+        await sleep(700);
+        const lp = r2(c.lensPosition);
+        const next = [...picks, lp].slice(-2);
+        setPicks(next);
+        if (next.length === 2) {
+          const lo = Math.min(next[0], next[1]);
+          const hi = Math.max(next[0], next[1]);
+          setRange([r2(clamp(lo - 0.03, 0, 1)), r2(clamp(hi + 0.03, 0, 1))]);
+          setLocal(`ピント範囲を ${r2(clamp(lo - 0.03, 0, 1))}〜${r2(clamp(hi + 0.03, 0, 1))} にしました。`);
+          setPick(false);
+        } else {
+          setLocal(`1点目(位置 ${lp})を記録しました。もう1点(反対側の端)をタップしてください。`);
+        }
+      } catch (e) {
+        setLocal('ピントを合わせられませんでした: ' + (e instanceof Error ? e.message : String(e)));
+      }
+    },
+    [picks, disabled],
+  );
+
+  const startPick = () => {
+    setPicks([]);
+    setPick(true);
+    setLocal('手前の端(一番近くで合わせたい所)をタップしてください。次に奥の端をタップします。');
+  };
+
+  const mainLabel =
+    mode === 'photo'
+      ? disabled
+        ? '処理中…'
+        : req.queue
+          ? '撮影して端末に保存'
+          : '撮影して保存'
+      : '';
 
   return (
     <Modal visible animationType="slide" presentationStyle="fullScreen" onRequestClose={onClose}>
       <SafeAreaProvider>
         <SafeAreaView style={s.root}>
           <View style={s.top}>
-            <Text style={s.title}>{req.title}</Text>
+            <Text style={s.title} numberOfLines={1}>
+              {titleText || req.title}
+            </Text>
             <Pressable onPress={onClose} style={s.closeBtn}>
               <Text style={s.closeT}>閉じる</Text>
             </Pressable>
@@ -138,74 +349,138 @@ export default function NativeCamera({ req, message, sending, savedTick, onSend,
             <>
               <View style={s.preview}>
                 {device ? (
-                  <Camera ref={camRef} style={StyleSheet.absoluteFill} device={device} isActive outputs={[photoOutput]} />
+                  <Camera ref={camRef} style={StyleSheet.absoluteFill} device={device} isActive outputs={outputs} zoom={curZoom} />
                 ) : (
                   <View style={s.center}>
-                    <Text style={s.w}>このレンズは使えません</Text>
+                    <Text style={s.w}>カメラが見つかりません</Text>
+                  </View>
+                )}
+                {pick && (
+                  <Pressable
+                    style={StyleSheet.absoluteFill}
+                    onPress={(e) => onPreviewTap(e.nativeEvent.locationX, e.nativeEvent.locationY)}
+                  >
+                    <View style={s.pickHint}>
+                      <Text style={s.pickT}>{picks.length === 0 ? '手前の端をタップ' : '奥の端をタップ'}</Text>
+                    </View>
+                  </Pressable>
+                )}
+                {mode === 'qr' && (
+                  <View style={s.pickHint} pointerEvents="none">
+                    <Text style={s.pickT}>QRコードを写してください</Text>
                   </View>
                 )}
               </View>
               <Text style={s.diag}>
-                使用中: {device ? device.localizedName : '-'}({physTypes.join(' / ') || '-'}){'\n'}
-                {device && !lensMatches ? '※選んだレンズが無いため、別のレンズを使っています。' : ''}
-                {device ? (device.supportsFocusLocking ? '' : '※このレンズはピント位置の固定に非対応') : ''}
+                {device ? `${device.localizedName} / 倍率 ${fmtZ(curZoom / baseZoom)}` : '-'}
+                {target ? `  撮影先: ${target}` : ''}
+                {qrLast ? `  QR: ${qrLast.slice(0, 40)}` : ''}
+                {geoText ? `  ${geoText}` : ''}
               </Text>
 
               <ScrollView style={s.panel} contentContainerStyle={{ padding: 12, gap: 10 }}>
                 {req.modes.length > 1 && (
                   <View style={s.row}>
                     {req.modes.map((m) => (
-                      <Chip key={m} label={m === 'photo' ? '写真' : 'ピント合成'} on={mode === m} onPress={() => !disabled && setMode(m)} />
+                      <Chip
+                        key={m}
+                        label={m === 'photo' ? '写真' : m === 'burst' ? 'ピント合成' : 'QR読み取り'}
+                        on={mode === m}
+                        onPress={() => !disabled && setMode(m)}
+                      />
                     ))}
                   </View>
                 )}
-                <Text style={s.label}>レンズ</Text>
-                <View style={s.row}>
-                  {LENSES.map((l) => (
-                    <Chip key={l.key} label={l.label} on={lens === l.key} onPress={() => !disabled && setLens(l.key)} />
-                  ))}
-                </View>
 
-                {mode === 'burst' && (
+                {mode !== 'qr' && (
                   <>
-                    <Text style={s.label}>枚数 / ピントの範囲(0=近い 1=遠い)</Text>
+                    <Text style={s.label}>レンズ(倍率)</Text>
                     <View style={s.row}>
-                      {[3, 5, 7, 9].map((n) => (
-                        <Chip key={n} label={`${n}枚`} on={steps === n} onPress={() => !disabled && setSteps(n)} />
+                      {lenses.map((l) => (
+                        <Chip key={l.label} label={l.label} on={Math.abs(curZoom - l.z) < 0.01} onPress={() => !disabled && setZoom(l.z)} />
                       ))}
                     </View>
                     <View style={s.row}>
-                      {RANGES.map((r) => (
+                      <Chip label={tripod ? '三脚モード: オン' : '三脚モード: オフ'} on={tripod} onPress={() => !disabled && setTripod(!tripod)} />
+                      {[0, 3, 10].map((t) => (
+                        <Chip key={t} label={t === 0 ? 'タイマーなし' : `${t}秒`} on={timer === t} onPress={() => !disabled && setTimer(t)} />
+                      ))}
+                    </View>
+                  </>
+                )}
+
+                {req.queue && mode !== 'qr' && (
+                  <>
+                    <Text style={s.label}>ファイル名(任意)</Text>
+                    <TextInput value={name} onChangeText={setName} style={s.input} placeholder="例: ○○の株元" />
+                  </>
+                )}
+
+                {mode === 'burst' && (
+                  <>
+                    <Text style={s.label}>撮り方</Text>
+                    <View style={s.row}>
+                      <Chip label="写真で(高画質)" on={method === 'photo'} onPress={() => !disabled && setMethod('photo')} />
+                      <Chip label="動画から(短時間・実験)" on={method === 'video'} onPress={() => !disabled && setMethod('video')} />
+                    </View>
+                    <Text style={s.label}>ピントの範囲(0=近い 1=遠い): {range[0]}〜{range[1]}</Text>
+                    <View style={s.row}>
+                      <Chip label="タップで自動指定" on={pick} onPress={() => !disabled && startPick()} />
+                      {[[0.2, 0.8], [0, 1], [0, 0.5], [0.5, 1]].map((r) => (
                         <Chip
                           key={r.join('-')}
                           label={`${r[0]}〜${r[1]}`}
                           on={range[0] === r[0] && range[1] === r[1]}
-                          onPress={() => !disabled && setRange(r)}
+                          onPress={() => !disabled && setRange([r[0], r[1]])}
                         />
                       ))}
                     </View>
-                    <Text style={s.hint}>撮る位置: {pos.join(' → ')}</Text>
+                    {method === 'photo' ? (
+                      <>
+                        <Text style={s.label}>枚数</Text>
+                        <View style={s.row}>
+                          {[3, 5, 7, 9].map((n) => (
+                            <Chip key={n} label={`${n}枚`} on={steps === n} onPress={() => !disabled && setSteps(n)} />
+                          ))}
+                        </View>
+                        <Text style={s.hint}>撮る位置: {pos.join(' → ')}</Text>
+                      </>
+                    ) : (
+                      <>
+                        <Text style={s.label}>取り出すコマ数</Text>
+                        <View style={s.row}>
+                          {[8, 12, 16].map((n) => (
+                            <Chip key={n} label={`${n}コマ`} on={vframes === n} onPress={() => !disabled && setVframes(n)} />
+                          ))}
+                        </View>
+                      </>
+                    )}
                   </>
                 )}
 
-                {mode === 'photo' ? (
-                  <Btn label={disabled ? '処理中…' : '撮影して保存'} onPress={shootPhoto} disabled={disabled} />
-                ) : (
+                {mode === 'photo' && <Btn label={mainLabel} onPress={shootPhoto} disabled={disabled || !device} />}
+                {mode === 'burst' && (
                   <>
-                    <Btn label={busy ? '撮影中…' : `ピントをずらして ${steps}枚 撮る`} onPress={shootBurst} disabled={disabled} />
+                    <Btn
+                      label={busy ? '撮影中…' : method === 'photo' ? `ピントをずらして ${steps}枚 撮る` : '動画で撮ってコマを取り出す'}
+                      onPress={method === 'photo' ? shootBurst : shootVideo}
+                      disabled={disabled || !device}
+                    />
                     {frames.length > 0 && (
                       <>
                         <View style={s.row}>
-                          {frames.map((f, i) => (
+                          {frames.map((f) => (
                             <View key={f.path} style={s.thumbBox}>
                               <Image source={{ uri: 'file://' + f.path }} style={s.thumb} />
-                              <Text style={s.cap}>
-                                {i + 1}: 指定{f.target}/実測{f.actual.toFixed(2)}
-                              </Text>
+                              <Text style={s.cap}>{f.label}</Text>
                             </View>
                           ))}
                         </View>
-                        <Btn label="ピント合成して保存" onPress={() => onSend('burst', frames.map((f) => ({ path: f.path })))} disabled={disabled} />
+                        <Btn
+                          label={req.queue ? 'ピント合成用に端末へ保存' : 'ピント合成して保存'}
+                          onPress={() => onSend('burst', frames.map((f) => ({ path: f.path })), meta)}
+                          disabled={disabled}
+                        />
                       </>
                     )}
                   </>
@@ -215,10 +490,9 @@ export default function NativeCamera({ req, message, sending, savedTick, onSend,
                 {!!local && <Text style={s.msg}>{local}</Text>}
                 {!!message.text && <Text style={[s.msg, message.error && { color: '#b00020' }]}>{message.text}</Text>}
 
-                {req.hasWeb && (
+                {req.hasWeb && !req.queue && (
                   <View style={s.row}>
-                    <Chip label="動画(Web版カメラ)" on={false} onPress={() => !disabled && onUseWeb('video')} />
-                    <Chip label="QR(Web版カメラ)" on={false} onPress={() => !disabled && onUseWeb('qr')} />
+                    <Chip label="動画(Web版カメラ)" on={false} onPress={() => !disabled && onUseWeb()} />
                   </View>
                 )}
               </ScrollView>
@@ -248,11 +522,13 @@ function Chip({ label, on, onPress }: { label: string; on: boolean; onPress: () 
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#111' },
   top: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 10 },
-  title: { color: '#fff', fontWeight: '700', fontSize: 16, flex: 1 },
+  title: { color: '#fff', fontWeight: '700', fontSize: 16, flex: 1, marginRight: 8 },
   closeBtn: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: 14, backgroundColor: '#333' },
   closeT: { color: '#fff' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12 },
   preview: { height: '34%', backgroundColor: '#000' },
+  pickHint: { position: 'absolute', left: 0, right: 0, top: 8, alignItems: 'center' },
+  pickT: { color: '#fff', backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 10, overflow: 'hidden' },
   diag: { color: '#9fd', fontSize: 11, paddingHorizontal: 10, paddingVertical: 4 },
   panel: { flex: 1, backgroundColor: '#f4f6f4' },
   row: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
@@ -260,6 +536,7 @@ const s = StyleSheet.create({
   hint: { color: '#455', fontSize: 12 },
   msg: { color: '#124', fontSize: 13 },
   w: { color: '#fff' },
+  input: { borderWidth: 1, borderColor: '#9ab', borderRadius: 8, padding: 10, fontSize: 15, backgroundColor: '#fff' },
   btn: { backgroundColor: '#2e7d32', padding: 14, borderRadius: 10, alignItems: 'center' },
   btnT: { color: '#fff', fontWeight: '700', fontSize: 15 },
   chip: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 18, borderWidth: 1, borderColor: '#2e7d32', backgroundColor: '#fff' },
