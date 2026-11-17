@@ -203,6 +203,21 @@ export const INJECT_BEFORE = `
           if (p.geo) { window.__ncGeo = { lat: p.geo.lat, lng: p.geo.lng, acc: p.geo.acc, at: Date.now() }; }
           try { d = await window.PlantCam.stack(arr, p.extra || {}); } finally { delete blobs[p.key]; if (p.geo) { window.__ncGeo = null; } }
         }
+        else if (kind === 'libfile') {
+          // ファイル管理へ、分割して送る(library_upload.php)
+          var f = blobs[p.key] && blobs[p.key][0]; if (!f) { throw new Error('送るファイルがありません'); }
+          try {
+            var bl = f.blob, CH = 3 * 1024 * 1024, total = Math.max(1, Math.ceil(bl.size / CH));
+            var uid = 'ap' + Math.random().toString(36).slice(2, 12) + Date.now().toString(36).slice(-6);
+            for (var ci = 0; ci < total; ci++) {
+              var fd = new FormData();
+              fd.append('upload_id', uid); fd.append('index', String(ci)); fd.append('total', String(total));
+              fd.append('name', p.name); fd.append('size', String(bl.size));
+              fd.append('chunk', bl.slice(ci * CH, Math.min(bl.size, (ci + 1) * CH)), p.name);
+              d = await apiJson('library_upload.php', { method: 'POST', headers: { 'X-CSRF-Token': csrf() }, body: fd });
+            }
+          } finally { delete blobs[p.key]; }
+        }
         else { throw new Error('不明な指示です'); }
         reply(rid, true, d);
       } catch (e) { reply(rid, false, e); }

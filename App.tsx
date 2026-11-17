@@ -5,6 +5,7 @@
 //  ・撮影場所の記録 / 予定・期限の通知 / ホーム画面アイコン長押しからの起動
 //  ・調べもの画面(iPad は分割表示)と、長押しメニュー(一時メモ・ファイル管理へ保存)
 import { Directory, File, Paths } from 'expo-file-system';
+import * as DocumentPicker from 'expo-document-picker';
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as Location from 'expo-location';
 import * as QuickActions from 'expo-quick-actions';
@@ -15,6 +16,7 @@ import {
   ActivityIndicator,
   Alert,
   AppState,
+  Linking,
   Modal,
   Platform,
   Pressable,
@@ -77,6 +79,9 @@ export default function App() {
   const [showQueue, setShowQueue] = useState(false);
   const [queueItems, setQueueItems] = useState<QItem[]>([]);
 
+  const [ready, setReady] = useState(false); // 設定を読み終えた
+  const [pendTick, setPendTick] = useState(0);
+  const pendingUrl = useRef<string | null>(null); // 開かれたURL(スキーム・ファイル)の処理待ち
   const [splitOn, setSplitOn] = useState(false);
   const [phoneResearch, setPhoneResearch] = useState(false);
   const [rUrl, setRUrl] = useState('');
@@ -139,6 +144,7 @@ export default function App() {
       setSettings(s);
       setDraft(s);
       if (s.faceLock) setLocked(true);
+      setReady(true);
     });
     readExpiry().then(async (d) => {
       setExpiry(d);
@@ -901,6 +907,140 @@ export default function App() {
     [toast],
   );
 
+  // ---------- ファイルの取り込み(ファイルApp・AirDrop・「このアプリで開く」)→ ファイル管理 ----------
+  const importFiles = useCallback(
+    async (files: { uri: string; name: string; size?: number }[]) => {
+      if (!files.length) return;
+      try {
+        if (!(await ensureWorker())) throw new Error('サーバーに接続できません(VPN・ログインを確認してください)');
+      } catch (e) {
+        toast('取り込めませんでした: ' + errMsg(e));
+        return;
+      }
+      let ok = 0;
+      const errs: string[] = [];
+      for (const f of files) {
+        try {
+          let size = f.size ?? 0;
+          if (!size) {
+            try {
+              size = new File(f.uri).size ?? 0;
+            } catch {
+              // 大きさが分からなくても続ける
+            }
+          }
+          if (size > 30 * 1024 * 1024) throw new Error('30MBを超えるファイルは、パソコンから取り込んでください');
+          toast(`取り込み中… ${f.name}`);
+          const key = 'lib' + Date.now().toString(36) + ok;
+          const ext = (f.name.split('.').pop() || '').toLowerCase();
+          const mime = ext === 'pdf' ? 'application/pdf' : ext === 'png' ? 'image/png' : ext === 'heic' ? 'image/heic' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'application/octet-stream';
+          await putFile(key, 0, f.name, mime, f.uri);
+          await call('libfile', { key, name: f.name }, 300000);
+          ok++;
+          logInfo('ファイルを取り込みました: ' + f.name);
+        } catch (e) {
+          errs.push(`${f.name}: ${errMsg(e)}`);
+          logError('取り込みに失敗: ' + f.name + ' ' + errMsg(e));
+        }
+      }
+      toast(errs.length ? `取り込み ${ok}件 / 失敗 ${errs.length}件(${errs[0]})`.slice(0, 120) : `ファイル管理へ ${ok}件 取り込みました`);
+    },
+    [call, ensureWorker, putFile, toast],
+  );
+
+  const pickFiles = useCallback(async () => {
+    try {
+      const r = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true, type: '*/*' });
+      if (r.canceled) return;
+      importFiles(r.assets.map((a) => ({ uri: a.uri, name: a.name, size: a.size ?? undefined })));
+    } catch (e) {
+      toast('ファイルを選べませんでした: ' + errMsg(e));
+    }
+  }, [importFiles, toast]);
+
+  // ---------- 他から開かれたとき(ショートカット・Action Button・ファイル)----------
+  //   plantapp://quick/photo | quick/burst | quick/qr | research?url=… | settings | diag | import
+  const handleUrl = useCallback(
+    (raw: string) => {
+      if (/^file:/i.test(raw)) {
+        let name = 'file';
+        try {
+          name = decodeURIComponent(raw.split('?')[0].split('/').pop() || 'file');
+        } catch {
+          // そのまま
+        }
+        importFiles([{ uri: raw, name }]);
+        return;
+      }
+      const m = /^plantapp:\/\/([^?#]*)(?:\?([^#]*))?/i.exec(raw);
+      if (!m) return;
+      const path = m[1].replace(/^\/+|\/+$/g, '').toLowerCase();
+      const q: Record<string, string> = {};
+      (m[2] || '').split('&').forEach((kv) => {
+        const i = kv.indexOf('=');
+        if (i > 0) {
+          try {
+            q[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1).replace(/\+/g, ' '));
+          } catch {
+            // 読めない値は無視
+          }
+        }
+      });
+      logInfo('URLで開かれました: ' + path);
+      switch (path) {
+        case 'quick':
+        case 'quick/photo':
+          openQuick('photo');
+          break;
+        case 'quick/burst':
+          openQuick('burst');
+          break;
+        case 'quick/qr':
+          openQuick('qr');
+          break;
+        case 'research': {
+          if (isPad && wide) setSplitOn(true);
+          else setPhoneResearch(true);
+          if (/^https?:\/\//i.test(q.url || '')) openInResearch(q.url);
+          break;
+        }
+        case 'settings':
+          if (settings) setDraft(settings);
+          refreshPending();
+          setShowSettings(true);
+          break;
+        case 'diag':
+          openDiag();
+          break;
+        case 'import':
+          pickFiles();
+          break;
+      }
+    },
+    [importFiles, isPad, openDiag, openInResearch, openQuick, pickFiles, refreshPending, settings, wide],
+  );
+
+  useEffect(() => {
+    Linking.getInitialURL().then((u) => {
+      if (u) {
+        pendingUrl.current = u;
+        setPendTick((t) => t + 1);
+      }
+    });
+    const sub = Linking.addEventListener('url', ({ url }) => {
+      pendingUrl.current = url;
+      setPendTick((t) => t + 1);
+    });
+    return () => sub.remove();
+  }, []);
+  useEffect(() => {
+    // 設定を読み終え、Face ID の確認が済んでから処理する
+    if (!ready || locked || !pendingUrl.current) return;
+    const u = pendingUrl.current;
+    pendingUrl.current = null;
+    handleUrl(u);
+  }, [ready, locked, pendTick, handleUrl]);
+
   if (!settings) {
     return (
       <View style={s.center}>
@@ -1225,6 +1365,15 @@ export default function App() {
                 </Text>
                 <Pressable style={s.btn} onPress={applySettings}>
                   <Text style={s.btnT}>保存して開く</Text>
+                </Pressable>
+                <Pressable
+                  style={s.btn2}
+                  onPress={() => {
+                    setShowSettings(false);
+                    pickFiles();
+                  }}
+                >
+                  <Text style={s.btn2T}>ファイルを取り込む(ファイルApp・AirDrop)</Text>
                 </Pressable>
                 <Pressable
                   style={s.btn2}

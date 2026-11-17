@@ -1,0 +1,39 @@
+diff --git a/node_modules/expo-text-extractor/ios/ExpoTextExtractorModule.swift b/node_modules/expo-text-extractor/ios/ExpoTextExtractorModule.swift
+--- a/node_modules/expo-text-extractor/ios/ExpoTextExtractorModule.swift
++++ b/node_modules/expo-text-extractor/ios/ExpoTextExtractorModule.swift
+@@ -12,8 +12,19 @@
+         AsyncFunction("extractTextFromImage") { (url: URL, promise: Promise) in
+             do {
+                 let imageData = try Data(contentsOf: url)
+-                let image = UIImage(data: imageData)
+-                guard let cgImage = image?.cgImage else {
++                guard let image = UIImage(data: imageData) else {
++                    throw Exception.init(name: "err", description: "err")
++                }
++                // 写真の向き(EXIF)を反映した画像に描き直す。大きすぎるときは長辺 3000px に縮める
++                let longSide = max(image.size.width, image.size.height)
++                let ratio: CGFloat = longSide > 3000 ? 3000 / longSide : 1
++                let size = CGSize(width: image.size.width * ratio, height: image.size.height * ratio)
++                let format = UIGraphicsImageRendererFormat.default()
++                format.scale = 1
++                let fixed = UIGraphicsImageRenderer(size: size, format: format).image { _ in
++                    image.draw(in: CGRect(origin: .zero, size: size))
++                }
++                guard let cgImage = fixed.cgImage else {
+                     throw Exception.init(name: "err", description: "err")
+                 }
+ 
+@@ -29,6 +40,13 @@
+ 
+                     promise.resolve(recognizedTexts)
+                 }
++                request.recognitionLevel = .accurate
++                request.usesLanguageCorrection = true
++                if #available(iOS 16.0, *) {
++                    // 日本語を読めるようにする(標準は英語のみ)
++                    request.revision = VNRecognizeTextRequestRevision3
++                    request.recognitionLanguages = ["ja-JP", "en-US"]
++                }
+ 
+                 try requestHandler.perform([request])
+             } catch {

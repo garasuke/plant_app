@@ -7,6 +7,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ActivityIndicator, Image, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useKeepAwake } from 'expo-keep-awake';
 import { DeviceMotion } from 'expo-sensors';
+import { extractTextFromImage } from 'expo-text-extractor';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { getThumbnailAsync } from 'expo-video-thumbnails';
 import {
@@ -97,6 +98,8 @@ export default function NativeCamera({
   const [qrLast, setQrLast] = useState('');
   const [name, setName] = useState('');
   const [torch, setTorch] = useState(false);
+  const [ocrLines, setOcrLines] = useState<string[] | null>(null); // ラベルから読み取った行
+  const [ocrBusy, setOcrBusy] = useState(false);
   const [compact, setCompactRaw] = useState(lastCompact); // true: メニューを隠して、映像を大きくする
   const [bigIdx, setBigIdx] = useState(0); // 連写の確認で、大きく見ているコマ
   const setCompact = (v: boolean) => {
@@ -221,6 +224,25 @@ export default function NativeCamera({
       onQR(v);
     }
   };
+
+  // ラベルの文字を読む(押したときだけ動く。自動では読まない)。撮った写真は保存せず、文字だけ使う
+  const readLabel = async () => {
+    if (!device || busy || ocrBusy) return;
+    setOcrBusy(true);
+    setOcrLines(null);
+    setLocal('ラベルを撮って、文字を読み取っています…');
+    try {
+      const pf = await photoOutput.capturePhotoToFile({}, {});
+      const lines = (await extractTextFromImage('file://' + pf.filePath)).map((l) => l.trim()).filter((l) => l.length >= 2);
+      setOcrLines(lines);
+      setLocal(lines.length ? '読み取れました。使う行を選んでください。' : '文字を読み取れませんでした。ラベルに近づき、ピントを合わせてもう一度試してください。');
+    } catch (e) {
+      setLocal('読み取りに失敗しました: ' + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setOcrBusy(false);
+    }
+  };
+  const canOcr = mode === 'photo' || (mode === 'burst' && method === 'photo');
 
   const countdown = useCallback(async () => {
     const sec = timer;
@@ -660,6 +682,35 @@ export default function NativeCamera({
                   </>
                 )}
 
+                {canOcr && (
+                  <>
+                    <Btn label={ocrBusy ? '読み取り中…' : 'ラベルの文字を読む(OCR)'} onPress={readLabel} disabled={disabled || ocrBusy || !device} />
+                    {ocrLines && ocrLines.length > 0 && (
+                      <View style={{ gap: 6 }}>
+                        <Text style={s.hint}>読み取った行({req.queue ? '「記録に紐づける」= QRと同じ。「名前に入れる」= ファイル名' : '「記録に紐づける」= QRと同じ'})</Text>
+                        {ocrLines.slice(0, 12).map((l, i) => (
+                          <View key={i} style={s.ocrRow}>
+                            <Text style={s.ocrT} numberOfLines={2}>
+                              {l}
+                            </Text>
+                            <Pressable style={s.ocrB} onPress={() => qrHandler.current(l)}>
+                              <Text style={s.ocrBT}>記録に紐づける</Text>
+                            </Pressable>
+                            {req.queue && (
+                              <Pressable style={s.ocrB} onPress={() => setName(l)}>
+                                <Text style={s.ocrBT}>名前に入れる</Text>
+                              </Pressable>
+                            )}
+                          </View>
+                        ))}
+                        <Pressable onPress={() => setOcrLines(null)}>
+                          <Text style={{ color: '#566', fontSize: 12 }}>閉じる</Text>
+                        </Pressable>
+                      </View>
+                    )}
+                  </>
+                )}
+
                 {req.queue && mode !== 'qr' && (
                   <>
                     <Text style={s.label}>ファイル名(任意)</Text>
@@ -829,6 +880,10 @@ const s = StyleSheet.create({
   chip: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 18, borderWidth: 1, borderColor: '#2e7d32', backgroundColor: '#fff' },
   chipOn: { backgroundColor: '#2e7d32' },
   chipT: { color: '#2e7d32', fontWeight: '600' },
+  ocrRow: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#fff', borderRadius: 8, padding: 6, borderWidth: 1, borderColor: '#cdd' },
+  ocrT: { flex: 1, color: '#233', fontSize: 13 },
+  ocrB: { paddingVertical: 5, paddingHorizontal: 8, borderRadius: 8, borderWidth: 1, borderColor: '#2e7d32' },
+  ocrBT: { color: '#2e7d32', fontSize: 11, fontWeight: '600' },
   gv: { position: 'absolute', top: 0, bottom: 0, width: 1, backgroundColor: 'rgba(255,255,255,0.45)' },
   gh: { position: 'absolute', left: 0, right: 0, height: 1, backgroundColor: 'rgba(255,255,255,0.45)' },
   lvBox: { position: 'absolute', alignSelf: 'center', top: '38%', alignItems: 'center', justifyContent: 'center', width: 90, height: 90 },

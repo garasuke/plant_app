@@ -2,7 +2,7 @@
   "expo": {
     "name": "植物管理",
     "slug": "plantclient",
-    "version": "3.5.0",
+    "version": "3.6.0",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -17,7 +17,20 @@
           "NSAllowsLocalNetworking": true
         },
         "ITSAppUsesNonExemptEncryption": false,
-        "NSLocationWhenInUseUsageDescription": "撮影した写真に、撮影場所(位置情報)を記録するために使います"
+        "NSLocationWhenInUseUsageDescription": "撮影した写真に、撮影場所(位置情報)を記録するために使います",
+        "CFBundleDocumentTypes": [
+          {
+            "CFBundleTypeName": "ファイル",
+            "LSHandlerRank": "Alternate",
+            "LSItemContentTypes": [
+              "public.image",
+              "com.adobe.pdf",
+              "public.plain-text",
+              "public.comma-separated-values-text",
+              "public.movie"
+            ]
+          }
+        ]
       }
     },
     "plugins": [
@@ -41,6 +54,7 @@
           "motionPermission": "撮影画面の水準器(傾きの表示)に使います"
         }
       ]
-    ]
+    ],
+    "scheme": "plantapp"
   }
 }
