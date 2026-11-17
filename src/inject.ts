@@ -227,6 +227,12 @@ export const INJECT_RESEARCH = `
   window.__rsInstalled = true;
   function post(m) { try { window.ReactNativeWebView.postMessage(JSON.stringify(m)); } catch (e) {} }
   var timer = null, sx = 0, sy = 0;
+  // iOS標準のリンクのメニュー(Open Link など)を出さず、こちらのメニューを使う
+  try {
+    var st = document.createElement('style');
+    st.textContent = 'a,img{-webkit-touch-callout:none !important;}';
+    (document.head || document.documentElement).appendChild(st);
+  } catch (e) {}
   function isInput(t) {
     if (!t || !t.closest) { return false; }
     return !!t.closest('input,textarea,select,[contenteditable],[contenteditable=""],[contenteditable="true"]');
@@ -244,7 +250,7 @@ export const INJECT_RESEARCH = `
       var sel = String(window.getSelection ? window.getSelection() : '').trim();
       if (sel) { return; }   // 文字が選ばれたときは、選択メニューのほうを使う
       post({ t: 'ctx', text: '', href: a ? a.href : '', src: img ? (img.currentSrc || img.src) : '', title: document.title, url: location.href });
-    }, 650);
+    }, 450);
   }, { passive: true });
   function cancel() { clearTimeout(timer); }
   document.addEventListener('touchmove', function (e) {

@@ -1,7 +1,7 @@
 // 調べもの用の簡易ブラウザ(iPad は右側に分割表示、iPhone は全画面で開く)。
 //  ・最初のページは、システムのブックマーク一覧
 //  ・複数のタブ / ページ内検索 / 閲覧履歴
-//  ・文字を選ぶと、iOS標準のメニューに「一時メモに追加」「検索」「ブックマークに追加」が出る
+//  ・文字を選ぶと、iOS標準のメニューに「一時メモに追加」「検索」が出る(ページの登録は★ボタン)
 //  ・リンク・画像を長押しすると、メモ / ファイル管理 / ブックマーク / リンク集 への登録メニューが出る
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
@@ -221,8 +221,8 @@ export default function ResearchBrowser({ home, linksUrl, url, navTick, onCtx, o
               menuItems={[
                 { label: '一時メモに追加', key: 'memo' },
                 { label: '検索', key: 'search' },
-                { label: 'ページをブックマークへ', key: 'bm' },
               ]}
+              allowsLinkPreview={false}
               onCustomMenuSelection={(e) => onSel(e.nativeEvent.key, e.nativeEvent.selectedText || '', { title: t.title, url: t.url })}
               onNavigationStateChange={(n) => {
                 if (n.url && n.url !== 'about:blank') {

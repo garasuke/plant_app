@@ -33,6 +33,7 @@ export type CamRequest = {
 export type Taken = { path: string };
 export type Msg = { text: string; error?: boolean };
 export type SendMeta = { name?: string; qr?: string };
+let lastCompact = false; // メニューを隠した状態を、次に開いたときも引き継ぐ
 export type CamOpts = { review: boolean; grid: boolean; keyShutter: boolean; lockExposure: boolean };
 
 type Frame = { path: string; label: string };
@@ -96,6 +97,12 @@ export default function NativeCamera({
   const [qrLast, setQrLast] = useState('');
   const [name, setName] = useState('');
   const [torch, setTorch] = useState(false);
+  const [compact, setCompactRaw] = useState(lastCompact); // true: メニューを隠して、映像を大きくする
+  const [bigIdx, setBigIdx] = useState(0); // 連写の確認で、大きく見ているコマ
+  const setCompact = (v: boolean) => {
+    lastCompact = v;
+    setCompactRaw(v);
+  };
   const [shot, setShot] = useState<string | null>(null); // 撮った直後の確認待ちの写真
   const [off, setOff] = useState<string[]>([]); // 合成から外すコマ
   const [tilt, setTilt] = useState<{ x: number; y: number; flat: boolean } | null>(null);
@@ -286,6 +293,7 @@ export default function NativeCamera({
     setBusy(true);
     setFrames([]);
     setOff([]);
+    setBigIdx(0);
     try {
       await countdown();
       await lockLight(c);
@@ -325,6 +333,7 @@ export default function NativeCamera({
     setBusy(true);
     setFrames([]);
     setOff([]);
+    setBigIdx(0);
     try {
       await countdown();
       await lockLight(c);
@@ -433,6 +442,10 @@ export default function NativeCamera({
           : '撮影して保存'
       : '';
 
+  // 確認中・メニューを隠した撮影中は、映像(確認画像)を画面いっぱいに大きく出す
+  const reviewing = !!shot;
+  const slim = reviewing || (compact && frames.length === 0);
+
   // 外部キーボードのスペース / Enter で、いま画面に出ている主なボタンを押す
   actRef.current = () => {
     if (!device || !hasPermission) return;
@@ -457,6 +470,11 @@ export default function NativeCamera({
             <Text style={s.title} numberOfLines={1}>
               {titleText || req.title}
             </Text>
+            {hasPermission && (
+              <Pressable onPress={() => setCompact(!compact)} style={[s.closeBtn, { marginRight: 8 }]}>
+                <Text style={s.closeT}>{compact ? 'メニューを出す' : 'メニューを隠す'}</Text>
+              </Pressable>
+            )}
             <Pressable onPress={onClose} style={s.closeBtn}>
               <Text style={s.closeT}>閉じる</Text>
             </Pressable>
@@ -469,7 +487,7 @@ export default function NativeCamera({
             </View>
           ) : (
             <>
-              <View style={s.preview}>
+              <View style={slim ? s.previewBig : s.preview}>
                 {device ? (
                   <Camera ref={camRef} style={StyleSheet.absoluteFill} device={device} isActive outputs={outputs} zoom={curZoom} />
                 ) : (
@@ -492,7 +510,12 @@ export default function NativeCamera({
                     <Text style={s.pickT}>QRコードを写してください</Text>
                   </View>
                 )}
-                {opts.grid && mode !== 'qr' && (
+                {reviewing && shot && (
+                  <View style={[StyleSheet.absoluteFill, { backgroundColor: '#000' }]} pointerEvents="none">
+                    <Image source={{ uri: 'file://' + shot }} style={StyleSheet.absoluteFill} resizeMode="contain" />
+                  </View>
+                )}
+                {opts.grid && mode !== 'qr' && !reviewing && (
                   <View style={StyleSheet.absoluteFill} pointerEvents="none">
                     <View style={[s.gv, { left: '33.3%' }]} />
                     <View style={[s.gv, { left: '66.6%' }]} />
@@ -541,6 +564,7 @@ export default function NativeCamera({
                   style={s.keyIn}
                 />
               )}
+              {!slim && (
               <Text style={s.diag}>
                 {device ? `${device.localizedName} / 倍率 ${fmtZ(curZoom / baseZoom)}` : '-'}
                 {device ? ` [レンズ${device.physicalDevices.length} 切替${(device.zoomLensSwitchFactors ?? []).join(',') || 'なし'} ズーム${device.minZoom}〜${device.maxZoom}]` : ''}
@@ -548,7 +572,43 @@ export default function NativeCamera({
                 {qrLast ? `  QR: ${qrLast.slice(0, 40)}` : ''}
                 {geoText ? `  ${geoText}` : ''}
               </Text>
+              )}
 
+              {slim && (
+                <View style={s.slimBar}>
+                  {(busy || blocking) && <ActivityIndicator />}
+                  {!!(local || message.text) && (
+                    <Text style={[s.msgDark, message.error && { color: '#ff8a80' }]} numberOfLines={2}>
+                      {local || message.text}
+                    </Text>
+                  )}
+                  {reviewing && shot ? (
+                    <View style={s.row}>
+                      <View style={{ flex: 1 }}>
+                        <Btn label={req.queue ? '端末に保存する' : '送る'} onPress={() => sendShot(shot)} />
+                      </View>
+                      <Pressable
+                        onPress={() => {
+                          setShot(null);
+                          setLocal('');
+                        }}
+                        style={[s.btn2, { flex: 1, justifyContent: 'center' }]}
+                      >
+                        <Text style={s.btn2T}>撮り直す</Text>
+                      </Pressable>
+                    </View>
+                  ) : mode === 'qr' ? (
+                    <Text style={s.msgDark}>QRコードを写してください(読み取ると自動で進みます)</Text>
+                  ) : (
+                    <Btn
+                      label={busy ? '撮影中…' : mode === 'burst' ? (method === 'photo' ? `ピントをずらして ${steps}枚 撮る` : '動画で撮ってコマを取り出す') : mainLabel}
+                      onPress={() => actRef.current()}
+                      disabled={disabled || !device}
+                    />
+                  )}
+                </View>
+              )}
+              {!slim && (
               <ScrollView style={s.panel} contentContainerStyle={{ padding: 12, gap: 10 }}>
                 {req.modes.length > 1 && (
                   <View style={s.row}>
@@ -661,21 +721,6 @@ export default function NativeCamera({
                   </>
                 )}
 
-                {mode === 'photo' && shot && (
-                  <>
-                    <Image source={{ uri: 'file://' + shot }} style={s.reviewImg} resizeMode="contain" />
-                    <Btn label={req.queue ? '端末に保存する' : '送る'} onPress={() => sendShot(shot)} />
-                    <Pressable
-                      onPress={() => {
-                        setShot(null);
-                        setLocal('');
-                      }}
-                      style={s.btn2}
-                    >
-                      <Text style={s.btn2T}>撮り直す</Text>
-                    </Pressable>
-                  </>
-                )}
                 {mode === 'photo' && !shot && <Btn label={mainLabel} onPress={shootPhoto} disabled={disabled || !device} />}
                 {mode === 'burst' && (
                   <>
@@ -686,13 +731,28 @@ export default function NativeCamera({
                     />
                     {frames.length > 0 && (
                       <>
-                        <Text style={s.hint}>ぶれたコマは、タップすると合成から外せます(残り {frames.length - off.length}枚)</Text>
+                        {(() => {
+                          const bi = Math.min(bigIdx, frames.length - 1);
+                          const bf = frames[bi];
+                          const bx = off.includes(bf.path);
+                          return (
+                            <>
+                              <Image source={{ uri: 'file://' + bf.path }} style={[s.bigImg, bx && { opacity: 0.3 }]} resizeMode="contain" />
+                              <Pressable style={s.btn2} onPress={() => setOff(bx ? off.filter((p) => p !== bf.path) : [...off, bf.path])}>
+                                <Text style={s.btn2T}>
+                                  {bx ? 'このコマを合成に戻す' : 'このコマを合成から外す'}({bi + 1}/{frames.length}・残り{frames.length - off.length}枚)
+                                </Text>
+                              </Pressable>
+                            </>
+                          );
+                        })()}
+                        <Text style={s.hint}>下のコマをタップすると、上に大きく出ます。ぶれたコマは外してください。</Text>
                         <View style={s.row}>
-                          {frames.map((f) => {
+                          {frames.map((f, i) => {
                             const x = off.includes(f.path);
                             return (
-                              <Pressable key={f.path} style={s.thumbBox} onPress={() => setOff(x ? off.filter((p) => p !== f.path) : [...off, f.path])}>
-                                <Image source={{ uri: 'file://' + f.path }} style={[s.thumb, x && { opacity: 0.25 }]} />
+                              <Pressable key={f.path} style={s.thumbBox} onPress={() => setBigIdx(i)}>
+                                <Image source={{ uri: 'file://' + f.path }} style={[s.thumb, x && { opacity: 0.25 }, i === bigIdx && { borderWidth: 2, borderColor: '#2e7d32' }]} />
                                 <Text style={s.cap}>{x ? '外す' : f.label}</Text>
                               </Pressable>
                             );
@@ -718,6 +778,7 @@ export default function NativeCamera({
                   </View>
                 )}
               </ScrollView>
+              )}
             </>
           )}
         </SafeAreaView>
@@ -749,6 +810,10 @@ const s = StyleSheet.create({
   closeT: { color: '#fff' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12 },
   preview: { height: '34%', backgroundColor: '#000' },
+  previewBig: { flex: 1, backgroundColor: '#000' },
+  slimBar: { padding: 12, gap: 8, backgroundColor: '#1b1f1b' },
+  msgDark: { color: '#cde', fontSize: 13 },
+  bigImg: { width: '100%', height: 300, backgroundColor: '#000', borderRadius: 8 },
   pickHint: { position: 'absolute', left: 0, right: 0, top: 8, alignItems: 'center' },
   pickT: { color: '#fff', backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 10, overflow: 'hidden' },
   diag: { color: '#9fd', fontSize: 11, paddingHorizontal: 10, paddingVertical: 4 },

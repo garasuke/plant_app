@@ -2,7 +2,7 @@
   "expo": {
     "name": "植物管理",
     "slug": "plantclient",
-    "version": "3.4.0",
+    "version": "3.5.0",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
