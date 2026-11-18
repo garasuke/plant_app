@@ -948,13 +948,18 @@ export default function App() {
     [call, ensureWorker, putFile, toast],
   );
 
+  const picking = useRef(false);
   const pickFiles = useCallback(async () => {
+    if (picking.current) return; // 選択画面が開いている間は、重ねて開かない
+    picking.current = true;
     try {
       const r = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true, type: '*/*' });
       if (r.canceled) return;
       importFiles(r.assets.map((a) => ({ uri: a.uri, name: a.name, size: a.size ?? undefined })));
     } catch (e) {
       toast('ファイルを選べませんでした: ' + errMsg(e));
+    } finally {
+      picking.current = false;
     }
   }, [importFiles, toast]);
 
@@ -1013,7 +1018,7 @@ export default function App() {
           openDiag();
           break;
         case 'import':
-          pickFiles();
+          setTimeout(pickFiles, 500);
           break;
       }
     },
@@ -1370,7 +1375,8 @@ export default function App() {
                   style={s.btn2}
                   onPress={() => {
                     setShowSettings(false);
-                    pickFiles();
+                    // 設定の画面が閉じ終わってから開く(閉じている途中だと、iOSは選択画面を出せない)
+                    setTimeout(pickFiles, 800);
                   }}
                 >
                   <Text style={s.btn2T}>ファイルを取り込む(ファイルApp・AirDrop)</Text>
