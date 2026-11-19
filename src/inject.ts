@@ -8,6 +8,12 @@ export const INJECT_BEFORE = `
   if (window.__ncInstalled) { return; }
   window.__ncInstalled = true;
   var seq = 0, sessions = {};
+  // アプリの下部バーに、サーバーの下部タブ(ホーム・植物など)をまとめたので、ページ側の下部タブは隠す
+  try {
+    var hs = document.createElement('style');
+    hs.textContent = '.tabbar{display:none !important} html:root{--tabbar-h:0px !important} body{padding-bottom:env(safe-area-inset-bottom,0px) !important}';
+    (document.head || document.documentElement).appendChild(hs);
+  } catch (e) {}
   function post(m) { try { window.ReactNativeWebView.postMessage(JSON.stringify(m)); } catch (e) {} }
   function modesOf(o) { return (o && o.modes && o.modes.length) ? o.modes : [(o && o.mode) || 'photo']; }
   function useNative(o) {
@@ -185,6 +191,7 @@ export const INJECT_BEFORE = `
         var d;
         if (kind === 'ping') { d = { csrf: !!csrf(), cam: !!window.PlantCam, url: location.href }; }
         else if (kind === 'notify') { d = await apiJson('notify_api.php?action=list&days=' + (p.days || 14) + '&event_days=' + (p.days || 14) + '&expiry_days=' + (p.days || 14)); }
+        else if (kind === 'targets') { d = await apiJson('cam_api.php?action=targets&q=' + encodeURIComponent(p.q)); }
         else if (kind === 'lookup') { d = await apiJson('cam_api.php?action=lookup&text=' + encodeURIComponent(p.text)); }
         else if (kind === 'memo') {
           d = await apiJson('memo_inbox_api.php', { method: 'POST', headers: { 'X-CSRF-Token': csrf() }, body: form({ action: 'add', data: JSON.stringify(p.data) }) });

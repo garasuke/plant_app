@@ -4,7 +4,9 @@
 // ・三脚モード(セルフタイマー+ピント移動後の待ち時間を長く)
 // ・順番待ち(圏外用)として使うときは、結果を端末内へ貯める(親が処理)
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Image, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Image, Modal, PanResponder, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+
+import { done as hapDone, tap as hapTap } from './haptic';
 import { useKeepAwake } from 'expo-keep-awake';
 import { DeviceMotion } from 'expo-sensors';
 import { extractTextFromImage } from 'expo-text-extractor';
@@ -35,7 +37,10 @@ export type Taken = { path: string };
 export type Msg = { text: string; error?: boolean };
 export type SendMeta = { name?: string; qr?: string };
 let lastCompact = false; // メニューを隠した状態を、次に開いたときも引き継ぐ
-export type CamOpts = { review: boolean; grid: boolean; keyShutter: boolean; lockExposure: boolean };
+export type CamOpts = { review: boolean; grid: boolean; keyShutter: boolean; lockExposure: boolean; haptics: boolean };
+export type Cand = { id: string; name: string; kind: string };
+let lastMode: CamMode | null = null; // 前回のモード・倍率を、次に開いたときも使う
+let lastZoom: { dev: string; z: number } | null = null;
 
 type Frame = { path: string; label: string };
 
@@ -61,6 +66,7 @@ type Props = {
   geoText: string;
   onSend: (kind: 'photo' | 'burst', files: Taken[], meta: SendMeta) => void;
   onQR: (text: string) => void;
+  onSearch: (q: string) => Promise<Cand[]>;
   onClose: () => void;
   onUseWeb: () => void;
 };
@@ -77,12 +83,15 @@ export default function NativeCamera({
   geoText,
   onSend,
   onQR,
+  onSearch,
   onClose,
   onUseWeb,
 }: Props) {
   useKeepAwake(); // 撮影画面を開いている間は、画面を暗くしない(三脚で待つとき用)
   const { hasPermission, requestPermission } = useCameraPermission();
-  const [mode, setMode] = useState<CamMode>(req.mode);
+  const [mode, setMode] = useState<CamMode>(req.id === 'quick' && lastMode && req.modes.includes(lastMode) ? lastMode : req.mode);
+  const [cands, setCands] = useState<{ q: string; rows: Cand[] } | null>(null);
+  const [ring, setRing] = useState<{ x: number; y: number; k: number } | null>(null);
   const [method, setMethod] = useState<'photo' | 'video'>('photo');
   const [steps, setSteps] = useState(5);
   const [vframes, setVframes] = useState(12);
@@ -130,7 +139,7 @@ export default function NativeCamera({
   const photoOutput = usePhotoOutput({ qualityPrioritization: 'quality', containerFormat: 'jpeg', quality: 0.9 });
   const videoOutput = useVideoOutput({ targetResolution: CommonResolutions.UHD_16_9, enableAudio: false });
   const objectOutput = useObjectOutput({
-    types: ['qr'],
+    types: ['qr', 'ean-13', 'ean-8', 'upc-e', 'code-128', 'code-39'],
     onObjectsScanned: (objs) => {
       for (const o of objs) {
         const v = (o as unknown as { value?: string }).value;
@@ -155,7 +164,50 @@ export default function NativeCamera({
     return out;
   }, [device]);
   const baseZoom = lenses.find((l) => l.label === '1x')?.z ?? device?.minZoom ?? 1;
-  const curZoom = zoom ?? baseZoom;
+  const savedZ = lastZoom && device && lastZoom.dev === device.id ? lastZoom.z : null;
+  const curZoom = zoom ?? savedZ ?? baseZoom;
+  useEffect(() => {
+    lastMode = mode;
+  }, [mode]);
+  useEffect(() => {
+    if (zoom !== null && device) lastZoom = { dev: device.id, z: zoom };
+  }, [zoom, device]);
+
+  // ピンチで倍率を変える(2本指)
+  const pinch = useRef({ d0: 0, z0: 1 });
+  const zoomRef = useRef(curZoom);
+  zoomRef.current = curZoom;
+  const devRef = useRef(device);
+  devRef.current = device;
+  const pinchPan = useMemo(
+    () =>
+      PanResponder.create({
+        onMoveShouldSetPanResponderCapture: (e) => e.nativeEvent.touches.length >= 2,
+        onPanResponderGrant: (e) => {
+          const t = e.nativeEvent.touches;
+          pinch.current = { d0: t.length >= 2 ? Math.hypot(t[0].pageX - t[1].pageX, t[0].pageY - t[1].pageY) : 0, z0: zoomRef.current };
+        },
+        onPanResponderMove: (e) => {
+          const t = e.nativeEvent.touches;
+          const d = devRef.current;
+          if (t.length < 2 || !d || !pinch.current.d0) return;
+          const r = Math.hypot(t[0].pageX - t[1].pageX, t[0].pageY - t[1].pageY) / pinch.current.d0;
+          setZoom(Math.min(Math.max(pinch.current.z0 * r, d.minZoom), Math.min(d.maxZoom, d.minZoom * 12)));
+        },
+      }),
+    [],
+  );
+
+  // 通常の撮影でも、タップした所にピントを合わせる
+  const tapFocus = async (x: number, y: number) => {
+    try {
+      await camRef.current?.focusTo({ x, y });
+      setRing({ x, y, k: Date.now() });
+      setTimeout(() => setRing((r) => (r && Date.now() - r.k > 1200 ? null : r)), 1300);
+    } catch {
+      // 合わせられないカメラでは何もしない
+    }
+  };
 
   const pos = useMemo(() => positions(steps, range[0], range[1]), [steps, range]);
 
@@ -273,6 +325,7 @@ export default function NativeCamera({
     try {
       await countdown();
       const pf = await photoOutput.capturePhotoToFile({}, {});
+      if (opts.haptics) hapDone();
       if (opts.review) {
         setShot(pf.filePath); // 送る前に確認する
         setLocal('撮れました。よければ「送る」、だめなら「撮り直す」を押してください。');
@@ -326,8 +379,10 @@ export default function NativeCamera({
         await sleep(settle);
         const pf = await photoOutput.capturePhotoToFile({}, {});
         out.push({ path: pf.filePath, label: `${i + 1}: ${pos[i]}` });
+        if (opts.haptics) hapTap();
       }
       setFrames(out);
+      if (opts.haptics) hapDone();
       setLocal(`${out.length}枚撮れました。よければ「ピント合成して保存」を押してください。`);
     } catch (e) {
       setLocal('連写に失敗: ' + (e instanceof Error ? e.message : String(e)));
@@ -392,6 +447,7 @@ export default function NativeCamera({
         out.push({ path: th.uri.replace(/^file:\/\//, ''), label: `${i + 1}: ${t}ms` });
       }
       setFrames(out);
+      if (opts.haptics) hapDone();
       setLocal(`${out.length}コマ取り出せました(動画 ${(dur / 1000).toFixed(1)}秒)。よければ「ピント合成して保存」を押してください。`);
     } catch (e) {
       setLocal('動画での連続撮影に失敗: ' + (e instanceof Error ? e.message : String(e)));
@@ -527,9 +583,15 @@ export default function NativeCamera({
                     </View>
                   </Pressable>
                 )}
+                {!pick && !reviewing && mode !== 'qr' && (
+                  <View style={StyleSheet.absoluteFill} {...pinchPan.panHandlers}>
+                    <Pressable style={StyleSheet.absoluteFill} onPress={(e) => tapFocus(e.nativeEvent.locationX, e.nativeEvent.locationY)} />
+                  </View>
+                )}
+                {ring && <View pointerEvents="none" style={[s.ring, { left: ring.x - 30, top: ring.y - 30 }]} />}
                 {mode === 'qr' && (
                   <View style={s.pickHint} pointerEvents="none">
-                    <Text style={s.pickT}>QRコードを写してください</Text>
+                    <Text style={s.pickT}>QR・バーコードを写してください</Text>
                   </View>
                 )}
                 {reviewing && shot && (
@@ -693,8 +755,23 @@ export default function NativeCamera({
                             <Text style={s.ocrT} numberOfLines={2}>
                               {l}
                             </Text>
+                            <Pressable
+                              style={s.ocrB}
+                              onPress={async () => {
+                                setLocal(`「${l.slice(0, 20)}」で記録を探しています…`);
+                                try {
+                                  const rows = await onSearch(l);
+                                  setCands({ q: l, rows });
+                                  setLocal(rows.length ? '候補から選んでください。' : '見つかりませんでした。別の行を試すか、手で探してください。');
+                                } catch (e) {
+                                  setLocal('探せませんでした: ' + (e instanceof Error ? e.message : String(e)));
+                                }
+                              }}
+                            >
+                              <Text style={s.ocrBT}>記録を探す</Text>
+                            </Pressable>
                             <Pressable style={s.ocrB} onPress={() => qrHandler.current(l)}>
-                              <Text style={s.ocrBT}>記録に紐づける</Text>
+                              <Text style={s.ocrBT}>QRとして使う</Text>
                             </Pressable>
                             {req.queue && (
                               <Pressable style={s.ocrB} onPress={() => setName(l)}>
@@ -703,7 +780,33 @@ export default function NativeCamera({
                             )}
                           </View>
                         ))}
-                        <Pressable onPress={() => setOcrLines(null)}>
+                        {cands && cands.rows.length > 0 && (
+                          <View style={{ gap: 6 }}>
+                            <Text style={s.hint}>「{cands.q.slice(0, 20)}」の候補(選ぶと、その記録に紐づけます)</Text>
+                            {cands.rows.slice(0, 10).map((r) => (
+                              <Pressable
+                                key={r.kind + r.id}
+                                style={s.candRow}
+                                onPress={() => {
+                                  qrHandler.current(r.id);
+                                  setCands(null);
+                                  setOcrLines(null);
+                                }}
+                              >
+                                <Text style={{ flex: 1, fontSize: 13 }}>
+                                  {r.kind ? r.kind + ': ' : ''}
+                                  {r.name}
+                                </Text>
+                              </Pressable>
+                            ))}
+                          </View>
+                        )}
+                        <Pressable
+                          onPress={() => {
+                            setOcrLines(null);
+                            setCands(null);
+                          }}
+                        >
                           <Text style={{ color: '#566', fontSize: 12 }}>閉じる</Text>
                         </Pressable>
                       </View>
@@ -884,6 +987,8 @@ const s = StyleSheet.create({
   ocrT: { flex: 1, color: '#233', fontSize: 13 },
   ocrB: { paddingVertical: 5, paddingHorizontal: 8, borderRadius: 8, borderWidth: 1, borderColor: '#2e7d32' },
   ocrBT: { color: '#2e7d32', fontSize: 11, fontWeight: '600' },
+  ring: { position: 'absolute', width: 60, height: 60, borderRadius: 30, borderWidth: 2, borderColor: '#ffd24a' },
+  candRow: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#fff', borderRadius: 8, padding: 6, borderWidth: 1, borderColor: '#cdd' },
   gv: { position: 'absolute', top: 0, bottom: 0, width: 1, backgroundColor: 'rgba(255,255,255,0.45)' },
   gh: { position: 'absolute', left: 0, right: 0, height: 1, backgroundColor: 'rgba(255,255,255,0.45)' },
   lvBox: { position: 'absolute', alignSelf: 'center', top: '38%', alignItems: 'center', justifyContent: 'center', width: 90, height: 90 },

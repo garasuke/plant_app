@@ -16,6 +16,11 @@ export type Settings = {
   expiryNotify: boolean; // 署名の期限の前日に通知する
   keyShutter: boolean; // 外部キーボードのスペース / Enter で撮影する
   lockExposure: boolean; // ピント合成の撮影中、明るさ・色を固定する
+  haptics: boolean; // 撮影の合図で短く振動する
+  shotWatch: boolean; // iPhone のスクリーンショットを撮ったとき、取り込むか尋ねる
+  gfOn: boolean; // 温室に着いたとき通知する
+  gfLat: number | null; // 温室の場所
+  gfLng: number | null;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -32,6 +37,11 @@ export const DEFAULT_SETTINGS: Settings = {
   expiryNotify: true,
   keyShutter: false,
   lockExposure: true,
+  haptics: true,
+  shotWatch: true,
+  gfOn: false,
+  gfLat: null,
+  gfLng: null,
 };
 
 const cfgFile = () => new File(Paths.document, 'client_config.json');
@@ -48,7 +58,11 @@ export async function loadSettings(): Promise<Settings> {
       if (typeof j.notifyHour === 'number') s.notifyHour = Math.max(0, Math.min(23, Math.round(j.notifyHour)));
       if (typeof j.notifyDays === 'number') s.notifyDays = Math.max(1, Math.min(60, Math.round(j.notifyDays)));
       if (j.sendSize === 'orig' || j.sendSize === '2048' || j.sendSize === '1280') s.sendSize = j.sendSize;
-      for (const k of ['savePhotos', 'review', 'grid', 'faceLock', 'expiryNotify', 'keyShutter', 'lockExposure'] as const) if (typeof j[k] === 'boolean') s[k] = j[k];
+      for (const k of ['savePhotos', 'review', 'grid', 'faceLock', 'expiryNotify', 'keyShutter', 'lockExposure', 'haptics', 'shotWatch', 'gfOn'] as const) if (typeof j[k] === 'boolean') s[k] = j[k];
+      if (typeof j.gfLat === 'number' && typeof j.gfLng === 'number') {
+        s.gfLat = j.gfLat;
+        s.gfLng = j.gfLng;
+      }
       return s;
     }
   } catch {

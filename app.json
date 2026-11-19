@@ -2,7 +2,7 @@
   "expo": {
     "name": "植物管理",
     "slug": "plantclient",
-    "version": "3.6.1",
+    "version": "3.7.0",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -52,6 +52,26 @@
         "expo-sensors",
         {
           "motionPermission": "撮影画面の水準器(傾きの表示)に使います"
+        }
+      ],
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "お世話や予定を、iPhoneのカレンダー(植物管理)へ書き出すために使います"
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "撮影した写真に、撮影場所(位置情報)を記録するために使います",
+          "locationAlwaysAndWhenInUsePermission": "温室に着いたときに、今日の作業を通知するために使います",
+          "isIosBackgroundLocationEnabled": true
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "スクリーンショットや写真を、ファイル管理へ取り込むために使います"
         }
       ]
     ],

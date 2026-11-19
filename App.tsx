@@ -9,10 +9,16 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as Location from 'expo-location';
 import * as QuickActions from 'expo-quick-actions';
+import * as ImagePicker from 'expo-image-picker';
+import * as Print from 'expo-print';
+import * as ScreenCapture from 'expo-screen-capture';
+import DocumentScanner from 'react-native-document-scanner-plugin';
+import { captureRef } from 'react-native-view-shot';
 import { StatusBar } from 'expo-status-bar';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActionSheetIOS,
+  Image,
   ActivityIndicator,
   Alert,
   AppState,
@@ -36,8 +42,11 @@ import { DEFAULT_SETTINGS, DEFAULT_URL, loadSettings, saveSettings, type Setting
 import { BUILD_AT, BUILD_SHA } from './src/buildinfo';
 import { daysLeft, readExpiry, scheduleExpiry } from './src/expiry';
 import { INJECT_BEFORE } from './src/inject';
+import { exportToCalendar } from './src/calendarOut';
+import { saveTodayCache, startGreenhouse, stopGreenhouse } from './src/geofence';
+import * as haptic from './src/haptic';
 import { clearLog, logError, logInfo, readLog, type LogEntry } from './src/log';
-import NativeCamera, { type CamMode, type CamRequest, type Msg, type SendMeta, type Taken } from './src/NativeCamera';
+import NativeCamera, { type Cand, type CamMode, type CamRequest, type Msg, type SendMeta, type Taken } from './src/NativeCamera';
 import { saveToPhotos } from './src/photos';
 import { shrinkIfNeeded } from './src/resize';
 import appJson from './app.json';
@@ -53,7 +62,17 @@ const stampOf = (t: number) => {
   const d = new Date(t);
   return `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
 };
-const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const errMsgRaw = (e: unknown) => (e instanceof Error ? e.message : String(e));
+// 英語のままの技術的なエラーを、分かる日本語にする(元の文は診断の記録に残る)
+const errMsg = (e: unknown) => {
+  const m = errMsgRaw(e);
+  if (/Network request failed|Failed to fetch|network/i.test(m)) return 'サーバーにつながりません(VPN・Wi-Fiを確認してください)';
+  if (/timeout|timed out|abort/i.test(m)) return '時間内に終わりませんでした(通信が遅いか、サーバーが混んでいます)';
+  if (/\b401\b|\b403\b|csrf/i.test(m)) return 'ログインの期限切れかもしれません(いったん画面を開き直してください)';
+  if (/\b413\b|too large/i.test(m)) return 'ファイルが大きすぎます';
+  if (/\b5\d\d\b/.test(m)) return 'サーバー側でエラーが出ました(' + m.slice(0, 60) + ')';
+  return m;
+};
 const isPad = (Platform as unknown as { isPad?: boolean }).isPad === true;
 
 export default function App() {
@@ -132,6 +151,12 @@ export default function App() {
   const [diagLog, setDiagLog] = useState<LogEntry[]>([]);
   const [diagNet, setDiagNet] = useState('');
   const [locked, setLocked] = useState(false);
+  const [showMemo, setShowMemo] = useState(false);
+  const [memoText, setMemoText] = useState('');
+  const [curPath, setCurPath] = useState('');
+  const [busy, setBusy] = useState('');
+  const [openSec, setOpenSec] = useState<Record<string, boolean>>({ shoot: false, safe: false, ios: false });
+  const shotRef = useRef<any>(null);
   const bgAt = useRef(0);
 
   const toast = useCallback((t: string) => {
@@ -335,6 +360,7 @@ export default function App() {
           date: String(r.date || ''),
           level: r.level,
         }));
+        saveTodayCache(items.map((x) => ({ title: x.title, date: x.date })));
         const n = await scheduleFromItems(items, st.notifyHour, st.notifyDays);
         lastNotify.current = Date.now();
         if (manual) toast(`通知を${n}件 予約しました`);
@@ -914,6 +940,7 @@ export default function App() {
       try {
         if (!(await ensureWorker())) throw new Error('サーバーに接続できません(VPN・ログインを確認してください)');
       } catch (e) {
+        setBusy('');
         toast('取り込めませんでした: ' + errMsg(e));
         return;
       }
@@ -930,7 +957,7 @@ export default function App() {
             }
           }
           if (size > 30 * 1024 * 1024) throw new Error('30MBを超えるファイルは、パソコンから取り込んでください');
-          toast(`取り込み中… ${f.name}`);
+          setBusy(`取り込み中 ${ok + errs.length + 1}/${files.length}: ${f.name}`.slice(0, 60));
           const key = 'lib' + Date.now().toString(36) + ok;
           const ext = (f.name.split('.').pop() || '').toLowerCase();
           const mime = ext === 'pdf' ? 'application/pdf' : ext === 'png' ? 'image/png' : ext === 'heic' ? 'image/heic' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'application/octet-stream';
@@ -943,6 +970,7 @@ export default function App() {
           logError('取り込みに失敗: ' + f.name + ' ' + errMsg(e));
         }
       }
+      setBusy('');
       toast(errs.length ? `取り込み ${ok}件 / 失敗 ${errs.length}件(${errs[0]})`.slice(0, 120) : `ファイル管理へ ${ok}件 取り込みました`);
     },
     [call, ensureWorker, putFile, toast],
@@ -962,6 +990,125 @@ export default function App() {
       picking.current = false;
     }
   }, [importFiles, toast]);
+
+  // ---------- スクショ・画面・書類スキャン → ファイル管理 ----------
+  const pickShots = useCallback(async () => {
+    if (picking.current) return;
+    picking.current = true;
+    try {
+      const r = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsMultipleSelection: true, selectionLimit: 10, quality: 1 });
+      if (r.canceled) return;
+      await importFiles(r.assets.map((a, i) => ({ uri: a.uri, name: a.fileName || `shot_${stampOf(Date.now())}_${i}.jpg`, size: a.fileSize ?? undefined })));
+      haptic.done();
+    } catch (e) {
+      toast('写真を選べませんでした: ' + errMsg(e));
+    } finally {
+      picking.current = false;
+    }
+  }, [importFiles, toast]);
+
+  const saveScreen = useCallback(async () => {
+    try {
+      const uri = await captureRef(shotRef, { format: 'jpg', quality: 0.92, result: 'tmpfile' });
+      await importFiles([{ uri, name: `screen_${stampOf(Date.now())}.jpg` }]);
+      haptic.done();
+    } catch (e) {
+      logError('画面の保存に失敗: ' + errMsgRaw(e));
+      toast('画面を保存できませんでした。iPhoneのスクリーンショットを撮り、「スクショを取り込む」を使ってください');
+    }
+  }, [importFiles, toast]);
+
+  const scanDoc = useCallback(async () => {
+    try {
+      const r = await DocumentScanner.scanDocument({ responseType: 'imageFilePath' as never });
+      const pages = r.scannedImages || [];
+      if (!pages.length) return;
+      setBusy('PDFを作っています…');
+      let body = '';
+      for (const pth of pages) {
+        const small = await shrinkIfNeeded(pth, '2048');
+        const b64 = await new File(small.startsWith('file://') ? small : 'file://' + small).base64();
+        body += `<div style="page-break-after:always;text-align:center"><img style="max-width:100%;max-height:95vh" src="data:image/jpeg;base64,${b64}"/></div>`;
+      }
+      const pdf = await Print.printToFileAsync({ html: `<html><body style="margin:0">${body}</body></html>` });
+      setBusy('');
+      await importFiles([{ uri: pdf.uri, name: `scan_${stampOf(Date.now())}.pdf` }]);
+      haptic.done();
+    } catch (e) {
+      toast('スキャンできませんでした: ' + errMsg(e));
+    } finally {
+      setBusy('');
+    }
+  }, [importFiles, toast]);
+
+  // ---------- カレンダーへ書き出す ----------
+  const calOut = useCallback(async () => {
+    try {
+      setBusy('カレンダーへ書き出し中…');
+      if (!(await ensureWorker())) throw new Error('Network request failed');
+      const d = await call('notify', { days: 60 });
+      const raw: any[] = (d && (d.items || (d.data && d.data.items))) || [];
+      const n = await exportToCalendar(raw.map((r) => ({ title: `${r.kind_label ? r.kind_label + ': ' : ''}${r.title || ''}`, date: String(r.date || '') })));
+      toast(`カレンダー「植物管理」へ ${n}件 書き出しました`);
+      haptic.done();
+    } catch (e) {
+      toast('書き出せませんでした: ' + errMsg(e));
+    } finally {
+      setBusy('');
+    }
+  }, [call, ensureWorker, toast]);
+
+  // ---------- スクリーンショットを撮ったら、取り込むか尋ねる ----------
+  useEffect(() => {
+    if (!settings?.shotWatch) return;
+    const sub = ScreenCapture.addScreenshotListener(() => {
+      Alert.alert('スクリーンショットを撮りました', 'ファイル管理へ取り込みますか?', [
+        { text: 'いいえ', style: 'cancel' },
+        { text: '選んで取り込む', onPress: () => setTimeout(pickShots, 600) },
+      ]);
+    });
+    return () => sub.remove();
+  }, [settings?.shotWatch, pickShots]);
+
+  // ---------- 温室に着いたら通知(ジオフェンス) ----------
+  useEffect(() => {
+    if (!settings) return;
+    if (settings.gfOn && settings.gfLat != null && settings.gfLng != null) {
+      startGreenhouse(settings.gfLat, settings.gfLng).then((e) => e && logError('温室の見張りを始められません: ' + e));
+    } else {
+      stopGreenhouse().catch(() => {});
+    }
+  }, [settings?.gfOn, settings?.gfLat, settings?.gfLng]);
+
+  const setGfHere = useCallback(async () => {
+    try {
+      const p = await Location.requestForegroundPermissionsAsync();
+      if (!p.granted) throw new Error('位置情報の許可が必要です');
+      const l = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      setDraft((d) => ({ ...d, gfLat: l.coords.latitude, gfLng: l.coords.longitude, gfOn: true }));
+      toast('今いる場所を温室にしました。「保存して開く」で反映します');
+    } catch (e) {
+      toast('現在地を取れませんでした: ' + errMsg(e));
+    }
+  }, [toast]);
+
+  const moreMenu = useCallback(() => {
+    const items: [string, () => void][] = [
+      [isPad && wide && splitOn ? '調べものを閉じる' : '調べもの', () => (isPad && wide ? setSplitOn(!splitOn) : setPhoneResearch(true))],
+      ['今の画面をファイル管理へ保存', saveScreen],
+      ['スクショ・写真を取り込む', pickShots],
+      ['書類をスキャン(PDF)', scanDoc],
+      ['ファイルを取り込む', pickFiles],
+      ['予定をカレンダーへ書き出す', calOut],
+      ['設定', () => { setDraft(settingsRef.current); refreshPending(); setShowSettings(true); }],
+    ];
+    ActionSheetIOS.showActionSheetWithOptions(
+      { options: [...items.map((i) => i[0]), 'キャンセル'], cancelButtonIndex: items.length },
+      (i) => { if (i < items.length) items[i][1](); },
+    );
+  }, [wide, splitOn, saveScreen, pickShots, scanDoc, pickFiles, calOut, refreshPending]);
+
+  const goPage = useCallback((path: string) => js(`location.href=${JSON.stringify(settingsRef.current.url.replace(/\/+$/, '') + path)}`), [js]);
 
   // ---------- 他から開かれたとき(ショートカット・Action Button・ファイル)----------
   //   plantapp://quick/photo | quick/burst | quick/qr | research?url=… | settings | diag | import
@@ -1076,6 +1223,7 @@ export default function App() {
       injectedJavaScriptBeforeContentLoaded={INJECT_BEFORE}
       onMessage={onMessage}
       onLoadStart={() => setLoadErr('')}
+      onNavigationStateChange={(n) => setCurPath((n.url || '').replace(/^https?:\/\/[^/]+/, '').split(/[?#]/)[0])}
       onError={(e) => setLoadErr(e.nativeEvent.description || '読み込めませんでした')}
       onHttpError={(e) => setLoadErr(`サーバーの応答エラー (${e.nativeEvent.statusCode})`)}
       onContentProcessDidTerminate={() => webRef.current?.reload()}
@@ -1097,7 +1245,9 @@ export default function App() {
         <StatusBar style="dark" />
         <View style={s.rowFill}>
           <View style={{ flex: 1 }}>
-            {mainWeb}
+            <View ref={shotRef} collapsable={false} style={{ flex: 1 }}>
+              {mainWeb}
+            </View>
             {!!expiry && daysLeft(expiry) <= 2 && (
               <View style={s.expiry}>
                 <Text style={s.expiryT}>
@@ -1133,37 +1283,33 @@ export default function App() {
           )}
         </View>
 
-        {/* 下の機能バー(画面の下部バーと重ならないよう、別の行にしてある) */}
+        {/* 下のバー(サーバー画面の下バーは隠してあり、これ1つにまとめてある) */}
         <View style={s.bottomBar}>
-          <Pressable style={s.tab} onPress={() => openQuick('photo')}>
+          {([['🏠', 'ホーム', '/home.php'], ['🌱', '植物', '/index.php'], ['📋', '記録', '/events.php']] as const).map(([ic, tx, pth]) => {
+            const on = curPath === pth || (pth === '/index.php' && curPath === '/') || (curPath.endsWith('/') && pth === '/home.php' && false);
+            return (
+              <Pressable key={pth} style={s.tab} onPress={() => { haptic.tap(); goPage(pth); }}>
+                <Text style={[s.tabI, on && { opacity: 1 }, !on && { opacity: 0.55 }]}>{ic}</Text>
+                <Text style={[s.tabT, on && { color: '#2e7d32', fontWeight: '700' }]}>{tx}</Text>
+              </Pressable>
+            );
+          })}
+          <Pressable style={s.tab} onPress={() => { haptic.tap(); openQuick('photo'); }}>
             <Text style={s.tabI}>📷</Text>
-            <Text style={s.tabT}>クイック撮影</Text>
+            <Text style={s.tabT}>撮影</Text>
             {pending > 0 && (
               <View style={s.badge}>
                 <Text style={s.badgeT}>{pending}</Text>
               </View>
             )}
           </Pressable>
-          <Pressable
-            style={s.tab}
-            onPress={() => {
-              if (isPad && wide) setSplitOn(!splitOn);
-              else setPhoneResearch(true);
-            }}
-          >
-            <Text style={s.tabI}>{split ? '✕' : '🔎'}</Text>
-            <Text style={s.tabT}>{split ? '調べものを閉じる' : '調べもの'}</Text>
+          <Pressable style={s.tab} onPress={() => { haptic.tap(); setShowMemo(true); }}>
+            <Text style={s.tabI}>📝</Text>
+            <Text style={s.tabT}>メモ</Text>
           </Pressable>
-          <Pressable
-            style={s.tab}
-            onPress={() => {
-              setDraft(settings);
-              refreshPending();
-              setShowSettings(true);
-            }}
-          >
-            <Text style={s.tabI}>⚙</Text>
-            <Text style={s.tabT}>設定</Text>
+          <Pressable style={s.tab} onPress={() => { haptic.tap(); moreMenu(); }}>
+            <Text style={s.tabI}>⋯</Text>
+            <Text style={s.tabT}>その他</Text>
           </Pressable>
         </View>
         {!!toastT && (
@@ -1171,6 +1317,45 @@ export default function App() {
             <Text style={s.toastT}>{toastT}</Text>
           </View>
         )}
+        {!!busy && (
+          <View style={s.busy} pointerEvents="none">
+            <ActivityIndicator color="#fff" />
+            <Text style={s.toastT}>{busy}</Text>
+          </View>
+        )}
+
+        {/* メモ(一時メモへ追加) */}
+        <Modal visible={showMemo} transparent animationType="fade" onRequestClose={() => setShowMemo(false)}>
+          <View style={s.shade}>
+            <View style={s.card}>
+              <Text style={s.h}>一時メモ</Text>
+              <TextInput
+                value={memoText}
+                onChangeText={setMemoText}
+                multiline
+                autoFocus
+                style={[s.input, { minHeight: 120, textAlignVertical: 'top' }]}
+                placeholder="思いついたことをそのまま書く"
+              />
+              <Pressable
+                style={s.btn}
+                onPress={async () => {
+                  const b = memoText.trim();
+                  if (!b) return;
+                  setShowMemo(false);
+                  setMemoText('');
+                  await memoAdd(b, 'アプリから', '');
+                  haptic.done();
+                }}
+              >
+                <Text style={s.btnT}>一時メモに追加</Text>
+              </Pressable>
+              <Pressable style={s.btn2} onPress={() => setShowMemo(false)}>
+                <Text style={s.btn2T}>閉じる</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
 
         {/* 裏方の画面(見えない)。送信・通知の取得・一時メモへの追加に使う */}
         <View style={s.hidden} pointerEvents="none">
@@ -1202,7 +1387,7 @@ export default function App() {
             message={camMsg}
             jobs={jobCount}
             jobText={jobText}
-            opts={{ review: settings.review, grid: settings.grid, keyShutter: settings.keyShutter, lockExposure: settings.lockExposure }}
+            opts={{ review: settings.review, grid: settings.grid, keyShutter: settings.keyShutter, lockExposure: settings.lockExposure, haptics: settings.haptics }}
             target={camTarget}
             forceMode={forceMode}
             titleText={camTitle}
@@ -1211,6 +1396,12 @@ export default function App() {
             onQR={onQR}
             onClose={closeCam}
             onUseWeb={onUseWeb}
+            onSearch={async (q): Promise<Cand[]> => {
+              if (!(await ensureWorker())) throw new Error('Network request failed');
+              const d = await call('targets', { q });
+              const rows: any[] = (d && (d.rows || (d.data && d.data.rows))) || [];
+              return rows.map((r) => ({ id: String(r.id), name: String(r.name || ''), kind: String(r.kind || '') }));
+            }}
           />
         )}
 
@@ -1232,6 +1423,7 @@ export default function App() {
                 {queueItems.length === 0 && <Text>ありません</Text>}
                 {queueItems.map((it) => (
                   <View key={it.id} style={s.qrow}>
+                    {it.files.length > 0 && <Image source={{ uri: itemFileUri(it, 0) }} style={s.qthumb} />}
                     <Text style={{ flex: 1, fontSize: 12 }}>
                       {stampOf(it.at)} {it.kind === 'photo' ? '写真' : `ピント合成 ${it.files.length}枚`}
                       {it.name ? ` 「${it.name}」` : ''}
@@ -1325,7 +1517,8 @@ export default function App() {
                     <Text style={s.hint}>通知は、アプリを開いたときに予約し直します。圏外のあいだは前回の予約が鳴ります。</Text>
                   </>
                 )}
-                <Text style={[s.h, { fontSize: 15, marginTop: 6 }]}>撮影</Text>
+                <Pressable onPress={() => setOpenSec({ ...openSec, shoot: !openSec.shoot })}><Text style={s.secH}>{openSec.shoot ? '▼' : '▶'} 撮影</Text></Pressable>
+                {openSec.shoot && (<>
                 <Text style={s.lbl}>送る写真の大きさ(長辺)</Text>
                 <View style={s.chips}>
                   {([['orig', 'そのまま'], ['2048', '2048px'], ['1280', '1280px']] as const).map(([v, t]) => (
@@ -1356,7 +1549,9 @@ export default function App() {
                   <Switch value={draft.keyShutter} onValueChange={(v) => setDraft({ ...draft, keyShutter: v })} />
                 </View>
                 {draft.keyShutter && <Text style={s.hint}>画面のキーボードが出てしまうときは、オフにしてください。Bluetooth のリモコンは、音量ボタンでの撮影には対応していません。</Text>}
-                <Text style={[s.h, { fontSize: 15, marginTop: 6 }]}>安全</Text>
+                </>)}
+                <Pressable onPress={() => setOpenSec({ ...openSec, safe: !openSec.safe })}><Text style={s.secH}>{openSec.safe ? '▼' : '▶'} 安全</Text></Pressable>
+                {openSec.safe && (<>
                 <View style={s.sw}>
                   <Text style={s.lbl}>開くときに Face ID で確認する</Text>
                   <Switch value={draft.faceLock} onValueChange={(v) => setDraft({ ...draft, faceLock: v })} />
@@ -1368,6 +1563,31 @@ export default function App() {
                 <Text style={s.hint}>
                   アプリの期限: {expiry ? `${expiry.getFullYear()}/${expiry.getMonth() + 1}/${expiry.getDate()} ${p2(expiry.getHours())}:${p2(expiry.getMinutes())}(あと${daysLeft(expiry)}日)` : '読み取れませんでした'}
                 </Text>
+                </>)}
+                <Pressable onPress={() => setOpenSec({ ...openSec, ios: !openSec.ios })}><Text style={s.secH}>{openSec.ios ? '▼' : '▶'} iPhoneならではの機能</Text></Pressable>
+                {openSec.ios && (
+                  <>
+                    <View style={s.sw}>
+                      <Text style={s.lbl}>振動で知らせる(撮影・保存)</Text>
+                      <Switch value={draft.haptics} onValueChange={(v) => setDraft({ ...draft, haptics: v })} />
+                    </View>
+                    <View style={s.sw}>
+                      <Text style={s.lbl}>スクショを撮ったら取り込みを尋ねる</Text>
+                      <Switch value={draft.shotWatch} onValueChange={(v) => setDraft({ ...draft, shotWatch: v })} />
+                    </View>
+                    <View style={s.sw}>
+                      <Text style={s.lbl}>温室に着いたら今日の作業を通知</Text>
+                      <Switch value={draft.gfOn} onValueChange={(v) => setDraft({ ...draft, gfOn: v })} />
+                    </View>
+                    <Pressable style={s.btn2} onPress={setGfHere}>
+                      <Text style={s.btn2T}>今いる場所を温室にする</Text>
+                    </Pressable>
+                    <Text style={s.hint}>
+                      {draft.gfLat != null && draft.gfLng != null ? `温室: ${draft.gfLat.toFixed(4)}, ${draft.gfLng.toFixed(4)}(半径150m)` : '温室の場所は未設定です'}
+                      {'\n'}「常に許可」が必要です。無料の署名では動かないことがあります。
+                    </Text>
+                  </>
+                )}
                 <Pressable style={s.btn} onPress={applySettings}>
                   <Text style={s.btnT}>保存して開く</Text>
                 </Pressable>
@@ -1450,6 +1670,18 @@ export default function App() {
               </Pressable>
               <Pressable
                 style={s.btn2}
+                onPress={() =>
+                  Share.share({
+                    message:
+                      `植物管理 診断 版${appJson.expo.version} (${BUILD_AT} / ${BUILD_SHA.slice(0, 7)})\n端末: ${Platform.OS} ${String(Platform.Version)}\nサーバー: ${settings.url}\n未送信 ${pending}件\n` +
+                      diagLog.map((e) => `${new Date(e.at).toLocaleTimeString()} ${e.level === 'error' ? '[ERR] ' : ''}${e.msg}`).join('\n'),
+                  }).catch(() => {})
+                }
+              >
+                <Text style={s.btn2T}>診断を共有する(コピー・送信)</Text>
+              </Pressable>
+              <Pressable
+                style={s.btn2}
                 onPress={() => {
                   clearLog();
                   setDiagLog([]);
@@ -1501,7 +1733,8 @@ const s = StyleSheet.create({
   expiryT: { color: '#fff', fontSize: 12, fontWeight: '600' },
   sync: { position: 'absolute', left: 8, bottom: 8, right: 8, backgroundColor: 'rgba(20,60,30,0.9)', borderRadius: 8, padding: 8 },
   syncT: { color: '#fff', fontSize: 12 },
-  toast: { position: 'absolute', left: 16, right: 16, top: 56, backgroundColor: 'rgba(0,0,0,0.8)', borderRadius: 10, padding: 10 },
+  toast: { position: 'absolute', left: 16, right: 16, bottom: 78, backgroundColor: 'rgba(0,0,0,0.85)', borderRadius: 10, padding: 10 },
+  busy: { position: 'absolute', left: 40, right: 40, top: '40%', backgroundColor: 'rgba(0,0,0,0.85)', borderRadius: 12, padding: 16, alignItems: 'center', gap: 8 },
   toastT: { color: '#fff', fontSize: 13 },
   shade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'center', padding: 24 },
   card: { backgroundColor: '#fff', borderRadius: 12, padding: 16, gap: 10 },
@@ -1513,6 +1746,8 @@ const s = StyleSheet.create({
   chip: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: 16, borderWidth: 1, borderColor: '#2e7d32', backgroundColor: '#fff' },
   chipOn: { backgroundColor: '#2e7d32' },
   chipT: { color: '#2e7d32', fontWeight: '600' },
+  qthumb: { width: 48, height: 48, borderRadius: 6, backgroundColor: '#ddd' },
+  secH: { fontSize: 15, fontWeight: '700', marginTop: 8, color: '#2e7d32' },
   qrow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#dde' },
   input: { borderWidth: 1, borderColor: '#9ab', borderRadius: 8, padding: 10, fontSize: 15 },
   btn: { backgroundColor: '#2e7d32', padding: 12, borderRadius: 10, alignItems: 'center' },
